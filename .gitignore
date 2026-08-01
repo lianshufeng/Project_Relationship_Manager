@@ -1,0 +1,39 @@
+# 依赖目录
+node_modules/
+
+# 构建与测试产物
+dist/
+coverage/
+artifacts/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# 本地环境配置（示例文件允许提交）
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# 日志与缓存
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+.vite/
+
+# 编辑器配置
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
