@@ -47,3 +47,10 @@
 - 涉及业务数据时必须验证 JSON 可解析、数据版本一致、关键实体与关系存在。
 - 涉及字段删除时必须同时检查类型、表单、详情展示、默认数据和兼容清理逻辑。
 - 验证修改文件均为 UTF-8 无 BOM，且中文未乱码。
+
+## Docker 部署
+
+- Docker 部署使用根目录 `Dockerfile` 和 `docker-compose.yml`，由单个 Node.js 容器同时提供前端页面与 `/api/project-data` 接口。
+- 镜像必须在本地通过 `docker compose up -d --build` 构建并启动，默认映射端口为 `4173`，可通过 `APP_PORT` 修改宿主机端口。
+- `store` 目录必须挂载到容器 `/app/store`，确保容器更新或重建后业务数据仍然保留。
+- 若使用 `vite preview` 直出页面，必须在 `vite.config.ts` 的 `preview.allowedHosts` 中放行实际访问域名，避免 Host 校验拦截。

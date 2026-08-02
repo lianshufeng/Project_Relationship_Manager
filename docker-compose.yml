@@ -1,0 +1,11 @@
+services:
+  relationship-manager:
+    image: project-relationship-manager:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-4173}:4173"
+    volumes:
+      - ./store:/app/store

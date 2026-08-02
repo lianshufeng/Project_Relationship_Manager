@@ -90,4 +90,9 @@ const localStorePlugin = {
   },
 };
 
-export default defineConfig({ plugins: [react(), localStorePlugin] });
+export default defineConfig({
+  plugins: [react(), localStorePlugin],
+  preview: {
+    allowedHosts: ['platform.dy.kuixingkeji.com'],
+  },
+});
