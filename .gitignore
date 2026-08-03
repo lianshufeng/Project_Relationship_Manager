@@ -11,6 +11,7 @@ vite.config.d.ts
 
 # 本地环境配置（示例文件允许提交）
 .env
+.env.*
 .env.local
 .env.*.local
 !.env.example

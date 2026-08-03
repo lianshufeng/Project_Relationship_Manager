@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ApartmentOutlined, AppstoreOutlined, BankOutlined, BuildOutlined, CameraOutlined, CarOutlined, DeleteOutlined,
   DownloadOutlined, EditOutlined, EnvironmentOutlined, ExpandOutlined, ExportOutlined, FileTextOutlined,
-  FullscreenOutlined, HolderOutlined, IdcardOutlined, ImportOutlined, LeftOutlined, PlusOutlined, ReloadOutlined, RightOutlined, SaveOutlined,
+  FullscreenOutlined, HolderOutlined, IdcardOutlined, ImportOutlined, LeftOutlined, PlusOutlined, ReloadOutlined, RightOutlined,
   SafetyCertificateOutlined, SearchOutlined, TeamOutlined, ToolOutlined, UserOutlined, VideoCameraOutlined,
 } from '@ant-design/icons';
 import {
@@ -12,11 +12,11 @@ import {
 import dagre from 'dagre';
 import { toPng } from 'html-to-image';
 import {
-  App as AntApp, Button, Card, Divider, Drawer, Dropdown, Empty, Form, Input, Modal, Popconfirm,
+  Alert, App as AntApp, Button, Card, Divider, Drawer, Dropdown, Empty, Form, Input, Modal, Popconfirm,
   Result, Select, Space, Spin, Tabs, Tag, Tooltip, Tree, Typography,
 } from 'antd';
 import type { DataNode } from 'antd/es/tree';
-import { entityLabels, id, isProjectData, normalizeProjectData, relationColors, relationLabels } from './data';
+import { entityLabels, isProjectData, normalizeProjectData, relationColors, relationLabels } from './data';
 import { ErrorBoundary } from './ErrorBoundary';
 import type { Entity, EntityType, ProjectRelationshipData, Relation, RelationType } from './types';
 import { collectionByType } from './types';
@@ -24,6 +24,21 @@ import { collectionByType } from './types';
 const { Text, Title } = Typography;
 const typeColors: Record<EntityType, string> = { project: '#1677ff', team: '#36cfc9', position: '#597ef7', person: '#13c2c2', product: '#52c41a', deviceType: '#fa8c16', device: '#9254de', area: '#fadb14' };
 const deviceCategoryLabels: Record<string, string> = { wearable: '人工佩戴设备', machinery: '机械绑定设备', mobile: '移动设备', fixed: '固定设备' };
+const apiBase = '/api/v1';
+const narrowViewportQuery = '(max-width: 900px)';
+
+async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(`${apiBase}${path}`, {
+    ...options,
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ message: '请求失败' })) as { message?: string | string[] };
+    const detail = Array.isArray(body.message) ? body.message.join('；') : body.message;
+    throw new Error(detail || `请求失败（${response.status}）`);
+  }
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
+}
 const iconMap: Record<string, React.ReactNode> = {
   BankOutlined: <BankOutlined />, ApartmentOutlined: <ApartmentOutlined />, TeamOutlined: <TeamOutlined />,
   UserOutlined: <UserOutlined />, IdcardOutlined: <IdcardOutlined />, SafetyCertificateOutlined: <SafetyCertificateOutlined />,
@@ -36,7 +51,7 @@ interface GraphNodeData extends Record<string, unknown> { entityType: EntityType
 
 function EntityNode({ data }: { data: GraphNodeData }) {
   const color = typeColors[data.entityType];
-  return <div className={`entity-node ${data.selected ? 'selected' : ''} ${data.dimmed ? 'dimmed' : ''}`} style={{ '--node-color': color } as React.CSSProperties}>
+  return <Tooltip title={<><div>{data.name}</div><div>{data.subtitle} · {data.count} 项关联</div></>} placement="top" mouseEnterDelay={.35}><div className={`entity-node ${data.selected ? 'selected' : ''} ${data.dimmed ? 'dimmed' : ''}`} style={{ '--node-color': color } as React.CSSProperties}>
     <Handle type="target" position={FlowPosition.Left} />
     <div className="node-icon">{iconMap[data.icon] ?? <AppstoreOutlined />}</div>
     <div className="node-main">
@@ -45,7 +60,7 @@ function EntityNode({ data }: { data: GraphNodeData }) {
       <div className="node-meta">{data.subtitle} · {data.count} 项关联</div>
     </div>
     <Handle type="source" position={FlowPosition.Right} />
-  </div>;
+  </div></Tooltip>;
 }
 
 const nodeTypes = { entity: EntityNode };
@@ -91,60 +106,70 @@ function layout<T extends Record<string, unknown>>(nodes: Node<T>[], edges: Edge
 function AppContent() {
   const { message, modal } = AntApp.useApp();
   const [data, setData] = useState<ProjectRelationshipData | null>(null);
+  const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const editMode = true;
-  const [dirty, setDirty] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedRelation, setSelectedRelation] = useState<string | null>(null);
   const [filter, setFilter] = useState('deviceChain');
-  const [leftPanelVisible, setLeftPanelVisible] = useState(true);
-  const [rightPanelVisible, setRightPanelVisible] = useState(true);
+  const [leftPanelVisible, setLeftPanelVisible] = useState(() => !window.matchMedia(narrowViewportQuery).matches);
+  const [rightPanelVisible, setRightPanelVisible] = useState(() => !window.matchMedia(narrowViewportQuery).matches);
   const [managerOpen, setManagerOpen] = useState(false);
   const [managerTab, setManagerTab] = useState<EntityType>('team');
   const [editor, setEditor] = useState<{ type: EntityType; item?: Entity } | null>(null);
   const [relationEditor, setRelationEditor] = useState<Partial<Relation> | null>(null);
-  const [history, setHistory] = useState<ProjectRelationshipData[]>([]);
-  const [future, setFuture] = useState<ProjectRelationshipData[]>([]);
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
+  const [clearConfirmText, setClearConfirmText] = useState('');
   const [form] = Form.useForm();
   const [relationForm] = Form.useForm();
   const fileRef = useRef<HTMLInputElement>(null);
   const flowRef = useRef<ReactFlowInstance<Node<GraphNodeData>, Edge> | null>(null);
-  const storeRevisionRef = useRef(0);
 
   const loadStoredFile = useCallback(async () => {
-    const response = await fetch('/api/project-data', { cache: 'no-store' });
-    if (!response.ok) throw new Error(response.status === 404 ? '项目数据文件不存在' : '项目数据文件读取失败');
-    const value: unknown = await response.json();
+    const projects = await apiRequest<Array<{ id: string }>>('/projects', { cache: 'no-store' });
+    if (!projects.length) return null;
+    const value: unknown = await apiRequest(`/projects/${projects[0].id}/graph`, { cache: 'no-store' });
     if (!isProjectData(value)) throw new Error('项目数据文件结构无效');
     if (value.dataRevision !== 16) throw new Error('项目数据版本不匹配');
     return normalizeProjectData(value);
   }, []);
 
-  const persistToStore = useCallback(async (value: ProjectRelationshipData) => {
-    const response = await fetch('/api/project-data', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
-    if (!response.ok) throw new Error('本地数据文件保存失败');
-  }, []);
-
-  useEffect(() => { (async () => { try { setData(await loadStoredFile()); } catch { setLoadError('无法读取 store/project-relationship-data.json'); message.error('数据载入失败'); } })(); }, [loadStoredFile, message]);
-  useEffect(() => { const handler = (event: BeforeUnloadEvent) => { if (dirty) event.preventDefault(); }; addEventListener('beforeunload', handler); return () => removeEventListener('beforeunload', handler); }, [dirty]);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        try {
+          const loaded = await loadStoredFile();
+          if (!cancelled) { setData(loaded); setLoadError(null); setLoading(false); }
+          return;
+        } catch {
+          if (attempt < 7) { await new Promise(resolve => window.setTimeout(resolve, 1500)); continue; }
+          if (!cancelled) { setLoadError('无法从 MongoDB 服务载入项目数据'); setLoading(false); message.error('数据载入失败'); }
+        }
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [loadStoredFile, message]);
 
   const elements = useMemo(() => data ? graphElements(data, selectedId, filter) : { nodes: [], edges: [] }, [data, selectedId, filter]);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>(elements.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(elements.edges);
-  useEffect(() => { setNodes(layout(elements.nodes, elements.edges, data?.settings.layoutDirection ?? 'LR')); setEdges(elements.edges); }, [elements, setEdges, setNodes]);
+  useEffect(() => { const placed = layout(elements.nodes, elements.edges, data?.settings.layoutDirection ?? 'LR').map(node => ({ ...node, position: data?.settings.positions[node.id] ?? node.position })); setNodes(placed); setEdges(elements.edges); }, [data?.settings.layoutDirection, data?.settings.positions, elements, setEdges, setNodes]);
   useEffect(() => { const timer = window.setTimeout(() => flowRef.current?.fitView({ padding: .12, duration: 350 }), 260); return () => window.clearTimeout(timer); }, [leftPanelVisible, rightPanelVisible]);
-  useEffect(() => { if (window.matchMedia('(max-width: 900px)').matches) setRightPanelVisible(false); }, []);
+  useEffect(() => {
+    const media = window.matchMedia(narrowViewportQuery);
+    const handleViewportChange = (event: MediaQueryListEvent) => {
+      if (event.matches) { setLeftPanelVisible(false); setRightPanelVisible(false); }
+    };
+    media.addEventListener('change', handleViewportChange);
+    return () => media.removeEventListener('change', handleViewportChange);
+  }, []);
 
-  const writeToStore = useCallback(async (value: ProjectRelationshipData, showSuccess = false) => { const revision = ++storeRevisionRef.current; setDirty(true); try { await persistToStore(value); if (revision === storeRevisionRef.current) setDirty(false); if (showSuccess) message.success('配置已保存'); return true; } catch { if (revision === storeRevisionRef.current) setDirty(true); message.error({ key: 'store-write-error', content: '配置保存失败' }); return false; } }, [message, persistToStore]);
-  const update = useCallback((next: ProjectRelationshipData) => { if (data) setHistory(items => [...items.slice(-24), structuredClone(data)]); setFuture([]); setData(next); setDirty(true); }, [data]);
-  const save = useCallback(async () => { if (!data) return; const positions = Object.fromEntries(nodes.map(node => [node.id, node.position])); const next = { ...data, settings: { ...data.settings, positions } }; setData(next); await writeToStore(next, true); }, [data, nodes, writeToStore]);
-  const undo = useCallback(() => { if (!data || !history.length) return; const previous = history.at(-1)!; setHistory(h => h.slice(0, -1)); setFuture(f => [structuredClone(data), ...f]); setData(previous); setDirty(true); }, [data, history]);
-  const redo = useCallback(() => { if (!data || !future.length) return; const next = future[0]; setFuture(f => f.slice(1)); setHistory(h => [...h, structuredClone(data)]); setData(next); setDirty(true); }, [data, future]);
-  useEffect(() => { const key = (event: KeyboardEvent) => { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); save(); } if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); undo(); } if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'y') { event.preventDefault(); redo(); } }; addEventListener('keydown', key); return () => removeEventListener('keydown', key); }, [redo, save, undo]);
-
-  const performLayout = () => { const placed = layout(nodes, edges, data?.settings.layoutDirection ?? 'LR'); setNodes(placed); setDirty(true); requestAnimationFrame(() => flowRef.current?.fitView({ padding: .14, duration: 500 })); };
-  const toggleLeftPanel = () => setLeftPanelVisible(visible => { const next = !visible; if (next && window.matchMedia('(max-width: 900px)').matches) setRightPanelVisible(false); return next; });
-  const toggleRightPanel = () => setRightPanelVisible(visible => { const next = !visible; if (next && window.matchMedia('(max-width: 900px)').matches) setLeftPanelVisible(false); return next; });
+  const update = useCallback((next: ProjectRelationshipData) => { setData(next); }, []);
+  const performLayout = async () => { if (!data) return; const placed = layout(nodes, edges, data.settings.layoutDirection); setNodes(placed); try { await apiRequest(`/projects/${data.project.id}/layouts`, { method: 'PATCH', body: JSON.stringify({ positions: placed.map(node => ({ entityId: node.id, x: node.position.x, y: node.position.y })) }) }); const positions = { ...data.settings.positions, ...Object.fromEntries(placed.map(node => [node.id, node.position])) }; setData({ ...data, settings: { ...data.settings, positions } }); message.success('自动布局已同步'); } catch (error) { message.error(error instanceof Error ? error.message : '自动布局同步失败'); } requestAnimationFrame(() => flowRef.current?.fitView({ padding: .14, duration: 500 })); };
+  const toggleLeftPanel = () => setLeftPanelVisible(visible => { const next = !visible; if (next && window.matchMedia(narrowViewportQuery).matches) setRightPanelVisible(false); return next; });
+  const toggleRightPanel = () => setRightPanelVisible(visible => { const next = !visible; if (next && window.matchMedia(narrowViewportQuery).matches) setLeftPanelVisible(false); return next; });
   const entityIndex = useMemo(() => new Map((data ? allEntities(data) : []).map(item => [item.entity.id, item])), [data]);
   const selected = selectedId ? entityIndex.get(selectedId) : undefined;
   const selectedRel = data?.relations.find(rel => rel.id === selectedRelation);
@@ -160,7 +185,7 @@ function AppContent() {
   const locate = (value: string) => { if (!entityIndex.has(value)) return; setSelectedId(value); setSelectedRelation(null); requestAnimationFrame(() => { const node = nodes.find(item => item.id === value); if (node) flowRef.current?.setCenter(node.position.x + 109, node.position.y + 41, { zoom: 1.3, duration: 450 }); }); };
   const entityOptions = (data ? allEntities(data) : []).map(item => ({ value: item.entity.id, label: `${entityLabels[item.type]} · ${item.entity.name}` }));
 
-  const exportJson = () => { if (!data) return; const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `项目部关系配置-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.json`; link.click(); URL.revokeObjectURL(link.href); };
+  const exportJson = async () => { if (!data) return; try { const value = await apiRequest<ProjectRelationshipData>(`/projects/${data.project.id}/export`, { cache: 'no-store' }); const blob = new Blob([JSON.stringify(value, null, 2)], { type: 'application/json;charset=utf-8' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `项目部关系配置-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.json`; link.click(); URL.revokeObjectURL(link.href); message.success('JSON 配置已导出'); } catch (error) { message.error(error instanceof Error ? error.message : 'JSON 导出失败'); } };
   const exportCompleteGraph = async () => {
     const viewport = document.querySelector<HTMLElement>('.graph-panel .react-flow__viewport');
     const flow = flowRef.current;
@@ -180,8 +205,12 @@ function AppContent() {
       message.success(`完整关系图已导出（${Math.round(width * pixelRatio)} × ${Math.round(height * pixelRatio)}）`);
     } catch { message.error('完整关系图导出失败'); }
   };
-  const importJson = async (file: File) => { try { const value: unknown = JSON.parse(await file.text()); if (!isProjectData(value)) throw new Error(); update(value); setSelectedId(null); message.success('导入成功，关系图已更新'); } catch { message.error('导入失败：请选择有效的配置文件'); } };
-  const reloadStoredData = () => modal.confirm({ title: '重新加载已保存数据？', content: '尚未保存的页面修改将丢失。', okText: '重新加载', cancelText: '取消', onOk: async () => { const value = await loadStoredFile(); setData(value); setDirty(false); setHistory([]); setFuture([]); setSelectedId(null); setSelectedRelation(null); message.success('已重新加载保存数据'); } });
+  const importJson = async (file: File) => { try { const value: unknown = JSON.parse(await file.text()); if (!isProjectData(value)) throw new Error('配置结构无效'); await apiRequest(`/projects/${value.project.id}/import`, { method: 'POST', body: JSON.stringify(value) }); const loaded = await loadStoredFile(); if (!loaded) throw new Error('导入后未读取到项目数据'); setData(loaded); setLoadError(null); setSelectedId(null); message.success('JSON 导入成功，关系图已更新'); } catch (error) { message.error(error instanceof Error ? error.message : '导入失败：请选择有效的 JSON 文件'); } };
+  const createBlankProject = async () => { try { await apiRequest('/projects', { method: 'POST', body: JSON.stringify({ name: '未命名项目部' }) }); const loaded = await loadStoredFile(); if (!loaded) throw new Error('项目创建后读取失败'); setData(loaded); setLoadError(null); message.success('空白项目已创建'); } catch (error) { message.error(error instanceof Error ? error.message : '项目创建失败'); } };
+  const openClearConfirm = () => { setClearConfirmText(''); setClearConfirmOpen(true); };
+  const clearProjectData = async () => { if (!data || clearConfirmText.trim() !== data.project.name) return; try { await apiRequest(`/projects/${data.project.id}`, { method: 'DELETE' }); setClearConfirmOpen(false); setClearConfirmText(''); setData(null); setSelectedId(null); setSelectedRelation(null); setManagerOpen(false); message.success('当前项目数据已清空'); } catch (error) { message.error(error instanceof Error ? error.message : '清空数据失败'); } };
+  const jsonFileInput = <input ref={fileRef} type="file" accept=".json,application/json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importJson(file); event.target.value = ''; }} />;
+  const reloadStoredData = () => modal.confirm({ title: '重新加载服务器数据？', content: '页面将重新读取 MongoDB 中的最新数据。', okText: '重新加载', cancelText: '取消', onOk: async () => { const value = await loadStoredFile(); setData(value); setSelectedId(null); setSelectedRelation(null); message.success('已重新加载服务器数据'); } });
 
   const populateEntityForm = () => {
     if (!editor) return;
@@ -204,55 +233,35 @@ function AppContent() {
   const saveEntity = async () => {
     if (!data || !editor) return;
     const values = await form.validateFields();
-    if (editor.type === 'project') {
-      update({ ...data, project: { ...data.project, ...values, id: data.project.id } });
+    try {
+      const { projectId: _projectId, ...payload } = values;
+      const endpoint = editor.item
+        ? `/projects/${data.project.id}/entities/${editor.item.id}`
+        : `/projects/${data.project.id}/entities`;
+      await apiRequest(endpoint, {
+        method: editor.item ? 'PATCH' : 'POST',
+        body: JSON.stringify({ ...payload, entityType: editor.type }),
+      });
+      setData(await loadStoredFile());
       setEditor(null);
-      message.success('已更新，等待保存');
-      return;
+      message.success(editor.item ? '实体已更新并同步' : '实体已新增并同步');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '实体保存失败');
     }
-    const { parentProductId, ...entityValues } = values;
-    const key = collectionByType[editor.type];
-    const list = data[key] as unknown as Entity[];
-    const item = { ...(editor.item ?? {}), ...entityValues, id: editor.item?.id ?? id(editor.type), icon: entityValues.icon ?? 'AppstoreOutlined' } as Entity;
-    if (editor.type === 'device') delete (item as Entity & { icon?: string }).icon;
-    const deviceType = editor.type === 'device' ? data.deviceTypes.find(type => type.id === entityValues.deviceTypeId) : undefined;
-    if (editor.type === 'device' && deviceType?.category !== 'fixed') (item as { areaId?: string }).areaId = undefined;
-    const nextList = editor.item ? list.map(old => old.id === item.id ? item : old) : [...list, item];
-    let next = { ...data, [key]: nextList } as ProjectRelationshipData;
-    if (editor.type === 'position') {
-      const containment: Relation = { id: data.relations.find(rel => rel.sourceId === data.project.id && rel.targetId === item.id && rel.relationType === 'contains')?.id ?? id('position'), sourceType: 'project', sourceId: data.project.id, targetType: 'position', targetId: item.id, relationType: 'contains', label: '设置岗位' };
-      next = { ...next, relations: [...data.relations.filter(rel => !(rel.targetId === item.id && rel.relationType === 'contains')), containment] };
-    }
-    if (editor.type === 'device') {
-      const previous = data.relations.find(rel => rel.sourceId === item.id && rel.relationType === 'installed_in');
-      const installation: Relation[] = deviceType?.category === 'fixed' && entityValues.areaId ? [{ id: previous?.id ?? id('installation'), sourceType: 'device', sourceId: item.id, targetType: 'area', targetId: entityValues.areaId, relationType: 'installed_in', label: '安装于' }] : [];
-      next = { ...next, relations: [...next.relations.filter(rel => !(rel.sourceId === item.id && rel.relationType === 'installed_in')), ...installation] };
-    }
-    if (editor.type === 'person') {
-      const positionIds = entityValues.positionIds as string[];
-      const assignments: Relation[] = positionIds.map(positionId => ({ id: data.relations.find(rel => rel.sourceId === item.id && rel.targetId === positionId && rel.relationType === 'holds_position')?.id ?? id('assignment'), sourceType: 'person', sourceId: item.id, targetType: 'position', targetId: positionId, relationType: 'holds_position', label: '担任' }));
-      next = { ...next, relations: [...next.relations.filter(rel => !(rel.sourceId === item.id && rel.relationType === 'holds_position')), ...assignments] };
-    }
-    if (editor.type === 'product') {
-      const previous = data.relations.find(rel => rel.sourceType === 'product' && rel.targetType === 'product' && rel.targetId === item.id && rel.relationType === 'contains');
-      const hierarchy: Relation[] = parentProductId && parentProductId !== item.id ? [{ id: previous?.id ?? id('product-parent'), sourceType: 'product', sourceId: parentProductId, targetType: 'product', targetId: item.id, relationType: 'contains', label: '集成子系统' }] : [];
-      next = { ...next, relations: [...next.relations.filter(rel => !(rel.sourceType === 'product' && rel.targetType === 'product' && rel.targetId === item.id && rel.relationType === 'contains')), ...hierarchy] };
-    }
-    update(next);
-    setEditor(null);
-    message.success(editor.item ? '已更新，等待保存' : '已新增，等待保存');
   };
-  const deleteEntity = (type: EntityType, entityId: string) => { if (!data || type === 'project') return; if (type === 'position') { const assigned = data.persons.filter(person => person.positionIds.includes(entityId)); if (assigned.length) { message.warning(`该岗位下还有 ${assigned.length} 名人员，请先调整人员岗位`); return; } } const relatedCount = data.relations.filter(rel => rel.sourceId === entityId || rel.targetId === entityId).length; modal.confirm({ title: `删除${entityLabels[type]}？`, content: relatedCount ? `该对象关联 ${relatedCount} 条关系，确认后将一并删除。` : '此操作无法撤销。', okText: '删除', okButtonProps: { danger: true }, onOk: () => { const key = collectionByType[type]; const list = data[key] as unknown as Entity[]; const next = { ...data, [key]: list.filter(item => item.id !== entityId), relations: data.relations.filter(rel => rel.sourceId !== entityId && rel.targetId !== entityId) } as ProjectRelationshipData; update(next); setSelectedId(null); message.success('已删除对象及关联关系，等待保存'); } }); };
+  const deleteEntity = (type: EntityType, entityId: string) => { if (!data || type === 'project') return; if (type === 'position') { const assigned = data.persons.filter(person => person.positionIds.includes(entityId)); if (assigned.length) { message.warning(`该岗位下还有 ${assigned.length} 名人员，请先调整人员岗位`); return; } } const relatedCount = data.relations.filter(rel => rel.sourceId === entityId || rel.targetId === entityId).length; modal.confirm({ title: `删除${entityLabels[type]}？`, content: relatedCount ? `该对象关联 ${relatedCount} 条关系，确认后将由服务端校验并清理。` : '此操作无法撤销。', okText: '删除', okButtonProps: { danger: true }, onOk: async () => { try { await apiRequest(`/projects/${data.project.id}/entities/${entityId}`, { method: 'DELETE' }); setData(await loadStoredFile()); setSelectedId(null); message.success('对象及关联数据已删除'); } catch (error) { message.error(error instanceof Error ? error.message : '删除失败'); throw error; } } }); };
 
   const recommendRelation = (sourceId?: string, targetId?: string): RelationType => { const source = sourceId ? entityIndex.get(sourceId)?.type : undefined; const target = targetId ? entityIndex.get(targetId)?.type : undefined; if ((source === 'position' || source === 'person') && (target === 'product' || target === 'device')) return 'uses'; if (source === 'person' && target === 'position') return 'holds_position'; if (source === 'product' && target === 'deviceType') return 'depends_on'; if (source === 'device' && target === 'product') return 'supports'; if (source === 'device' && target === 'area') return 'installed_in'; if (source === 'device') return 'binds_to'; return 'contains'; };
   const openRelationEditor = (relation?: Partial<Relation>) => { setRelationEditor(relation ?? { sourceType: 'position', targetType: 'product', relationType: 'uses' }); };
-  const saveRelation = async () => { if (!data) return; const values = await relationForm.validateFields(); const source = entityIndex.get(values.sourceId); const target = entityIndex.get(values.targetId); if (!source || !target) return message.error('请选择有效的源对象和目标对象'); if (source.type === 'person' || target.type === 'person') { const otherType = source.type === 'person' ? target.type : source.type; if (otherType !== 'position' && otherType !== 'device') return message.error('人员只能关联岗位或设备，不能直接关联区域'); } if ((source.type === 'device' && target.type === 'area') || (source.type === 'area' && target.type === 'device')) { const device = source.type === 'device' ? source.entity : target.entity; const deviceType = 'deviceTypeId' in device ? data.deviceTypes.find(type => type.id === device.deviceTypeId) : undefined; if (deviceType?.category !== 'fixed') return message.error('只有固定设备可以安装到区域'); } const relation: Relation = { ...values, id: relationEditor?.id ?? id('relation'), sourceType: source.type, targetType: target.type, label: values.label || relationLabels[values.relationType as RelationType] };
-    const relations = relationEditor?.id ? data.relations.map(old => old.id === relation.id ? relation : old) : [...data.relations, relation]; update({ ...data, relations }); setRelationEditor(null); message.success('关系已更新，等待保存'); };
-  const deleteRelation = (relationId: string) => { if (!data) return; update({ ...data, relations: data.relations.filter(rel => rel.id !== relationId) }); setSelectedRelation(null); message.success('关系已删除，等待保存'); };
-  const reorderEntityRelations = (entityId: string, draggedId: string, targetId: string) => { if (!data || draggedId === targetId) return; const related = data.relations.filter(rel => rel.sourceId === entityId || rel.targetId === entityId); const fromIndex = related.findIndex(rel => rel.id === draggedId); const targetIndex = related.findIndex(rel => rel.id === targetId); if (fromIndex < 0 || targetIndex < 0) return; const reordered = [...related]; const [dragged] = reordered.splice(fromIndex, 1); reordered.splice(targetIndex, 0, dragged); const relatedIds = new Set(related.map(rel => rel.id)); let cursor = 0; const relations = data.relations.map(rel => relatedIds.has(rel.id) ? reordered[cursor++] : rel); update({ ...data, relations }); message.success('关系顺序已调整，等待保存'); };
+  const saveRelation = async () => { if (!data) return; const values = await relationForm.validateFields(); const source = entityIndex.get(values.sourceId); const target = entityIndex.get(values.targetId); if (!source || !target) return message.error('请选择有效的源对象和目标对象'); try { const endpoint = relationEditor?.id ? `/projects/${data.project.id}/relations/${relationEditor.id}` : `/projects/${data.project.id}/relations`; await apiRequest(endpoint, { method: relationEditor?.id ? 'PATCH' : 'POST', body: JSON.stringify(values) }); setData(await loadStoredFile()); setRelationEditor(null); message.success('关系已同步'); } catch (error) { message.error(error instanceof Error ? error.message : '关系保存失败'); } };
+  const deleteRelation = async (relationId: string) => { if (!data) return; try { await apiRequest(`/projects/${data.project.id}/relations/${relationId}`, { method: 'DELETE' }); setData(await loadStoredFile()); setSelectedRelation(null); message.success('关系已删除'); } catch (error) { message.error(error instanceof Error ? error.message : '关系删除失败'); } };
+  const reorderEntityRelations = async (entityId: string, draggedId: string, targetId: string) => { if (!data || draggedId === targetId) return; const related = data.relations.filter(rel => rel.sourceId === entityId || rel.targetId === entityId); const fromIndex = related.findIndex(rel => rel.id === draggedId); const targetIndex = related.findIndex(rel => rel.id === targetId); if (fromIndex < 0 || targetIndex < 0) return; const reordered = [...related]; const [dragged] = reordered.splice(fromIndex, 1); reordered.splice(targetIndex, 0, dragged); const relatedIds = new Set(related.map(rel => rel.id)); let cursor = 0; const relations = data.relations.map(rel => relatedIds.has(rel.id) ? reordered[cursor++] : rel); try { await apiRequest(`/projects/${data.project.id}/relations/order`, { method: 'PATCH', body: JSON.stringify({ relationIds: relations.map(relation => relation.id) }) }); const nextData = { ...data, relations }; const nextElements = graphElements(nextData, selectedId, filter); const placed = layout(nextElements.nodes, nextElements.edges, data.settings.layoutDirection); try { if (placed.length) await apiRequest(`/projects/${data.project.id}/layouts`, { method: 'PATCH', body: JSON.stringify({ positions: placed.map(node => ({ entityId: node.id, x: node.position.x, y: node.position.y })) }) }); const positions = { ...data.settings.positions, ...Object.fromEntries(placed.map(node => [node.id, node.position])) }; update({ ...nextData, settings: { ...data.settings, positions } }); setNodes(placed); setEdges(nextElements.edges); message.success('关系顺序及图谱布局已同步'); } catch (error) { update(nextData); message.warning(error instanceof Error ? `关系顺序已同步，但图谱布局同步失败：${error.message}` : '关系顺序已同步，但图谱布局同步失败'); } } catch (error) { message.error(error instanceof Error ? error.message : '关系排序失败'); } };
   const onConnect = (connection: Connection) => { if (!editMode || !connection.source || !connection.target) return; const source = entityIndex.get(connection.source); const target = entityIndex.get(connection.target); const relationType = recommendRelation(connection.source, connection.target); openRelationEditor({ sourceId: connection.source, targetId: connection.target, sourceType: source?.type, targetType: target?.type, relationType, label: relationLabels[relationType] }); };
 
-  if (!data) return loadError ? <Result status="error" title="数据载入失败" subTitle={loadError} extra={<Button type="primary" onClick={() => location.reload()}>重新加载</Button>} /> : <div className="loading"><Spin size="large" /><Text>载入中</Text></div>;
+  if (loading) return <div className="loading"><Spin size="large" /><Text>载入中</Text></div>;
+  if (!data) return loadError
+    ? <Result status="error" title="数据载入失败" subTitle={loadError} extra={<Button type="primary" onClick={() => location.reload()}>重新加载</Button>} />
+    : <><Result status="info" title="暂无项目数据" subTitle="数据库当前为空，你可以创建空白项目或导入已有 JSON 配置。" extra={<Space><Button type="primary" icon={<PlusOutlined />} onClick={() => void createBlankProject()}>创建空白项目</Button><Button icon={<ImportOutlined />} onClick={() => fileRef.current?.click()}>导入 JSON</Button></Space>} />{jsonFileInput}</>;
   const managerTypes: EntityType[] = ['team', 'position', 'person', 'product', 'deviceType', 'device', 'area'];
   const managerList = managerTab === 'project' ? [] : data[collectionByType[managerTab]] as unknown as Entity[];
 
@@ -266,9 +275,8 @@ function AppContent() {
         <Tooltip title="适应画布"><Button icon={<ExpandOutlined />} onClick={() => flowRef.current?.fitView({ padding: .12, duration: 400 })} /></Tooltip>
         <Tooltip title="全屏"><Button icon={<FullscreenOutlined />} onClick={() => document.documentElement.requestFullscreen()} /></Tooltip>
         <Button icon={<CameraOutlined />} onClick={() => void exportCompleteGraph()}>导出完整关系图</Button>
-        <Dropdown menu={{ items: [{ key: 'import', label: '导入配置', icon: <ImportOutlined /> }, { key: 'export', label: '导出配置', icon: <ExportOutlined /> }, { key: 'reload', label: '重新加载已保存数据', icon: <ReloadOutlined /> }], onClick: ({ key }) => key === 'import' ? fileRef.current?.click() : key === 'export' ? exportJson() : reloadStoredData() }}><Button icon={<DownloadOutlined />}>数据</Button></Dropdown>
-        <Button type={dirty ? 'primary' : 'default'} icon={<SaveOutlined />} onClick={save}>{dirty ? '保存（有修改）' : '保存'}</Button>
-        <input ref={fileRef} type="file" accept=".json,application/json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importJson(file); event.target.value = ''; }} />
+        <Dropdown trigger={['click']} menu={{ items: [{ key: 'import', label: '导入 JSON', icon: <ImportOutlined /> }, { key: 'export', label: '导出 JSON', icon: <ExportOutlined /> }, { key: 'reload', label: '重新加载已保存数据', icon: <ReloadOutlined /> }, { type: 'divider' }, { key: 'clear', label: '清空当前项目数据', icon: <DeleteOutlined />, danger: true }], onClick: ({ key }) => key === 'import' ? fileRef.current?.click() : key === 'export' ? void exportJson() : key === 'clear' ? openClearConfirm() : reloadStoredData() }}><Button icon={<DownloadOutlined />}>数据</Button></Dropdown>
+        {jsonFileInput}
       </div>
     </header>
 
@@ -289,7 +297,7 @@ function AppContent() {
           <Button className="panel-toggle panel-toggle-right" shape="circle" size="small" aria-label={rightPanelVisible ? '隐藏详情面板' : '显示详情面板'} icon={rightPanelVisible ? <RightOutlined /> : <LeftOutlined />} onClick={toggleRightPanel} />
         </Tooltip>
         <div className="graph-caption"><div><Text className="eyebrow">RELATIONSHIP CANVAS</Text><strong>{filter === 'all' ? '全域关系视图' : filter === 'deviceChain' ? '设备业务全链路' : filter === 'area' ? '区域设备部署视图' : '聚焦关系视图'}</strong></div><div className="legend">{(['uses', 'installed_in', 'supports', 'binds_to'] as RelationType[]).map(type => <span key={type}><i style={{ background: relationColors[type] }} />{relationLabels[type]}</span>)}</div></div>
-        <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onInit={instance => { flowRef.current = instance; setTimeout(() => instance.fitView({ padding: .1 }), 80); }} onNodeClick={(_, node) => { setSelectedId(node.id); setSelectedRelation(null); }} onNodeDoubleClick={(_, node) => { const item = entityIndex.get(node.id); if (item) openEditor(item.type, item.entity); }} onEdgeClick={(_, edge) => { setSelectedRelation(edge.id); setSelectedId(null); }} onConnect={onConnect} nodesConnectable nodesDraggable onPaneClick={() => { setSelectedId(null); setSelectedRelation(null); }} onNodeDragStop={(_, node) => { if (!data) return; const next = { ...data, settings: { ...data.settings, positions: { ...data.settings.positions, [node.id]: node.position } } }; update(next); }} minZoom={.08} maxZoom={2.4} fitView>
+        <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onInit={instance => { flowRef.current = instance; setTimeout(() => instance.fitView({ padding: .1 }), 80); }} onNodeClick={(_, node) => { setSelectedId(node.id); setSelectedRelation(null); }} onNodeDoubleClick={(_, node) => { const item = entityIndex.get(node.id); if (item) openEditor(item.type, item.entity); }} onEdgeClick={(_, edge) => { setSelectedRelation(edge.id); setSelectedId(null); }} onConnect={onConnect} nodesConnectable nodesDraggable onPaneClick={() => { setSelectedId(null); setSelectedRelation(null); }} onNodeDragStop={(_, node) => { if (!data) return; const next = { ...data, settings: { ...data.settings, positions: { ...data.settings.positions, [node.id]: node.position } } }; update(next); void apiRequest(`/projects/${data.project.id}/layouts/${node.id}`, { method: 'PATCH', body: JSON.stringify(node.position) }).catch(error => message.error(error instanceof Error ? error.message : '节点布局同步失败')); }} minZoom={.08} maxZoom={2.4} fitView>
           <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="rgba(84,151,255,.18)" /><MiniMap nodeColor={node => typeColors[(node.data as GraphNodeData).entityType]} maskColor="rgba(4,15,28,.74)" /><Controls />
         </ReactFlow>
         {!nodes.length && <Empty className="graph-empty" description="暂无关系数据" />}
@@ -316,6 +324,13 @@ function AppContent() {
         <Form.Item name="targetId" label="目标对象" rules={[{ required: true }]}><Select showSearch options={entityOptions} optionFilterProp="label" /></Form.Item>
         <Form.Item name="label" label="关系名称"><Input placeholder="默认使用关系类型名称" /></Form.Item>
       </Form>
+    </Modal>
+    <Modal title="确认清空当前项目数据？" open={clearConfirmOpen} onCancel={() => { setClearConfirmOpen(false); setClearConfirmText(''); }} closable={false} maskClosable={false} footer={<Space><Button onClick={() => { setClearConfirmOpen(false); setClearConfirmText(''); }}>取消</Button><Button icon={<ExportOutlined />} onClick={() => void exportJson()}>先导出 JSON 备份</Button><Button danger type="primary" icon={<DeleteOutlined />} disabled={clearConfirmText.trim() !== data.project.name} onClick={() => void clearProjectData()}>永久清空</Button></Space>}>
+      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+        <Alert type="error" showIcon message="清空后无法撤回" description="将永久删除当前项目的全部实体、关系、布局和项目设置。此操作无法撤销，请先导出 JSON 备份。" />
+        <Text>请输入项目名称 <Text strong>{data.project.name}</Text> 以确认操作：</Text>
+        <Input status={clearConfirmText && clearConfirmText.trim() !== data.project.name ? 'error' : undefined} value={clearConfirmText} onChange={event => setClearConfirmText(event.target.value)} placeholder={data.project.name} autoComplete="off" />
+      </Space>
     </Modal>
   </div>;
 }
@@ -351,11 +366,11 @@ function EntityDetails({ data, type, entity, onLocate, onEdit, editMode, onAddRe
     {'areaId' in entity && <div className="detail-field"><span>安装区域</span><strong>{data.areas.find(area => area.id === entity.areaId)?.name ?? '未分配'}</strong></div>}
     {'code' in entity && entity.code && <div className="detail-field"><span>设备编码</span><strong>{entity.code}</strong></div>}
     <Divider>关联对象 · {relations.length}</Divider>
-    <div className="relation-list">{relations.length ? relations.map(rel => { const otherId = rel.sourceId === entity.id ? rel.targetId : rel.sourceId; const other = index.get(otherId); const otherName = other?.entity.name ?? '未知对象'; const displayLabel = rel.relationType === 'installed_in' && rel.targetId === entity.id ? '安装设备' : rel.relationType === 'holds_position' && rel.targetId === entity.id ? '任职人员' : (rel.label ?? relationLabels[rel.relationType]); return <div key={rel.id} className={`relation-item ${draggingId === rel.id ? 'dragging' : ''} ${dragOverId === rel.id ? 'drag-over' : ''}`} draggable={editMode} onDragStart={event => { setDraggingId(rel.id); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', rel.id); }} onDragEnter={() => { if (draggingId && draggingId !== rel.id) setDragOverId(rel.id); }} onDragOver={event => { if (editMode) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } }} onDrop={event => { event.preventDefault(); const draggedRelationId = event.dataTransfer.getData('text/plain') || draggingId; if (draggedRelationId && draggedRelationId !== rel.id) onReorderRelations(draggedRelationId, rel.id); setDraggingId(null); setDragOverId(null); }} onDragEnd={() => { setDraggingId(null); setDragOverId(null); }}>
+    <div className="relation-list">{relations.length ? relations.map(rel => { const otherId = rel.sourceId === entity.id ? rel.targetId : rel.sourceId; const other = index.get(otherId); const otherName = other?.entity.name ?? '未知对象'; const displayLabel = rel.relationType === 'installed_in' && rel.targetId === entity.id ? '安装设备' : rel.relationType === 'holds_position' && rel.targetId === entity.id ? '任职人员' : (rel.label ?? relationLabels[rel.relationType]); return <Tooltip key={rel.id} title={<><div>{displayLabel}</div><div>{otherName}</div></>} placement="left" mouseEnterDelay={.35}><div className={`relation-item ${draggingId === rel.id ? 'dragging' : ''} ${dragOverId === rel.id ? 'drag-over' : ''}`} draggable={editMode} onDragStart={event => { setDraggingId(rel.id); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', rel.id); }} onDragEnter={() => { if (draggingId && draggingId !== rel.id) setDragOverId(rel.id); }} onDragOver={event => { if (editMode) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } }} onDrop={event => { event.preventDefault(); const draggedRelationId = event.dataTransfer.getData('text/plain') || draggingId; if (draggedRelationId && draggedRelationId !== rel.id) onReorderRelations(draggedRelationId, rel.id); setDraggingId(null); setDragOverId(null); }} onDragEnd={() => { setDraggingId(null); setDragOverId(null); }}>
       {editMode && <span className="relation-drag-handle" title="拖拽调整顺序"><HolderOutlined /></span>}
       <button className="relation-main" onClick={() => onLocate(otherId)}><i style={{ background: relationColors[rel.relationType] }} /><span><small>{displayLabel}</small><strong>{otherName}</strong></span><ExportOutlined /></button>
       {editMode && <Popconfirm title="删除这条关系？" description={`${displayLabel}：${otherName}`} okText="删除关系" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => onDeleteRelation(rel.id)}><Button className="relation-delete" danger type="text" size="small" aria-label={`删除关系 ${otherName}`} title="删除关系" icon={<DeleteOutlined />} onClick={event => event.stopPropagation()} /></Popconfirm>}
-    </div>; }) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无关联" />}</div>
+    </div></Tooltip>; }) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无关联" />}</div>
     {editMode && <div className="detail-actions"><Button type="primary" icon={<PlusOutlined />} onClick={onAddRelation}>新增关系</Button></div>}
   </div>;
 }
