@@ -1,6 +1,6 @@
 import { Type } from 'class-transformer';
-import { IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Min, ValidateNested } from 'class-validator';
-import { deviceCategories, entityTypes, relationTypes, type EntityType, type RelationType } from '../database/schemas.js';
+import { IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { activityLevels, feedbackStatuses, deviceCategories, entityTypes, relationTypes, type EntityType, type FeedbackStatus, type RelationType } from '../database/schemas.js';
 
 export class CreateProjectDto {
   @IsOptional() @IsString() id?: string;
@@ -32,6 +32,7 @@ export class EntityMutationDto {
   @IsOptional() @IsArray() @IsString({ each: true }) positionIds?: string[];
   @IsOptional() @IsString() areaId?: string;
   @IsOptional() @IsString() parentProductId?: string;
+  @IsOptional() @Type(() => Number) @IsInt() @Min(0) @Max(100) @IsIn(activityLevels, { message: '使用状态评估值必须以 10% 为单位' }) activityLevel?: number;
 }
 
 export class RelationMutationDto {
@@ -69,4 +70,15 @@ export class UpdateGraphSettingsDto {
 export class ReorderRelationsDto {
   @IsArray() @IsString({ each: true }) relationIds: string[];
   @IsOptional() @IsInt() @Min(0) startSort?: number;
+}
+
+export class CreateFeedbackDto {
+  @IsOptional() @IsString() @MaxLength(5000) content?: string;
+  @IsOptional() @IsString() @MaxLength(50) authorName?: string;
+  @IsOptional() @IsIn(feedbackStatuses) status?: FeedbackStatus;
+}
+
+export class UpdateFeedbackDto extends CreateFeedbackDto {
+  @Type(() => Number) @IsInt() @Min(1) revision: number;
+  @IsOptional() @IsString() removeAttachmentIds?: string;
 }

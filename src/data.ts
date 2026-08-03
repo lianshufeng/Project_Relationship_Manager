@@ -27,15 +27,17 @@ export function normalizeProjectData(data: ProjectRelationshipData): ProjectRela
   const fixedDeviceIds = new Set(data.devices.filter(device => data.deviceTypes.find(type => type.id === device.deviceTypeId)?.category === 'fixed').map(device => device.id));
   return {
     ...data,
-    dataRevision: 16,
+    dataRevision: 17,
+    feedbackSummaries: data.feedbackSummaries || {},
     project: withoutStatus(data.project),
     positions: data.positions.map(position => ({ ...position, projectId: data.project.id })),
     persons: data.persons.map(person => withoutStatus({ ...person, positionIds: person.positionIds.filter(positionId => idsByType.position.has(positionId)) })),
-    products: data.products.map(product => withoutProductCategory(withoutStatus(product))),
+    products: data.products.map(product => ({ ...withoutProductCategory(withoutStatus(product)), activityLevel: Number.isInteger(product.activityLevel) ? product.activityLevel : 0 })),
     areas: data.areas.map(area => withoutAreaType(withoutRiskLevel(area))),
     devices: data.devices.map(device => {
       const normalized = withoutLegacyDeviceFields(withoutStatus(device));
-      return normalized.areaId && !idsByType.area.has(normalized.areaId) ? { ...normalized, areaId: undefined } : normalized;
+      const withActivity = { ...normalized, activityLevel: Number.isInteger(normalized.activityLevel) ? normalized.activityLevel : 0 };
+      return withActivity.areaId && !idsByType.area.has(withActivity.areaId) ? { ...withActivity, areaId: undefined } : withActivity;
     }),
     relations: data.relations.map(withoutEnabled).filter(relation => {
       if (!idsByType[relation.sourceType].has(relation.sourceId) || !idsByType[relation.targetType].has(relation.targetId)) return false;

@@ -3,9 +3,11 @@ import { MongooseModule } from '@nestjs/mongoose';
 import {
   EntityRecord, EntitySchema, GraphLayoutRecord, GraphLayoutSchema,
   GraphSettingsRecord, GraphSettingsSchema, MigrationRunRecord, MigrationRunSchema,
-  RelationRecord, RelationSchema,
+  RelationRecord, RelationSchema, EntityFeedbackRecord, EntityFeedbackSchema,
+  FeedbackAttachmentRecord, FeedbackAttachmentSchema,
 } from '../database/schemas.js';
-import { EntitiesController, LayoutsController, ProjectsController, RelationsController } from './project-data.controller.js';
+import { EntitiesController, FeedbackController, LayoutsController, ProjectsController, RelationsController } from './project-data.controller.js';
+import { FeedbackService } from './feedback.service.js';
 import { ProjectDataService } from './project-data.service.js';
 
 @Module({
@@ -14,10 +16,12 @@ import { ProjectDataService } from './project-data.service.js';
     { name: RelationRecord.name, schema: RelationSchema },
     { name: GraphLayoutRecord.name, schema: GraphLayoutSchema },
     { name: GraphSettingsRecord.name, schema: GraphSettingsSchema },
+    { name: EntityFeedbackRecord.name, schema: EntityFeedbackSchema },
+    { name: FeedbackAttachmentRecord.name, schema: FeedbackAttachmentSchema },
     { name: MigrationRunRecord.name, schema: MigrationRunSchema },
   ])],
-  controllers: [ProjectsController, EntitiesController, RelationsController, LayoutsController],
-  providers: [ProjectDataService],
+  controllers: [ProjectsController, EntitiesController, RelationsController, LayoutsController, FeedbackController],
+  providers: [ProjectDataService, FeedbackService],
   exports: [ProjectDataService],
 })
 export class ProjectDataModule {}

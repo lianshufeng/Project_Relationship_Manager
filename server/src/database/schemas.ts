@@ -1,12 +1,17 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import type { HydratedDocument } from 'mongoose';
+import { Schema as MongooseSchema, type HydratedDocument, type Types } from 'mongoose';
 
 export const entityTypes = ['project', 'team', 'position', 'person', 'product', 'deviceType', 'device', 'area'] as const;
 export const relationTypes = ['contains', 'belongs_to', 'holds_position', 'uses', 'depends_on', 'binds_to', 'installed_in', 'supports', 'manages', 'covers'] as const;
 export const deviceCategories = ['wearable', 'machinery', 'mobile', 'fixed'] as const;
+export const activityLevels = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] as const;
+export const feedbackKinds = ['feedback', 'handling'] as const;
+export const feedbackStatuses = ['pending', 'resolved'] as const;
 
 export type EntityType = (typeof entityTypes)[number];
 export type RelationType = (typeof relationTypes)[number];
+export type FeedbackKind = (typeof feedbackKinds)[number];
+export type FeedbackStatus = (typeof feedbackStatuses)[number];
 
 @Schema({ collection: 'entities', timestamps: true, strict: 'throw', versionKey: false })
 export class EntityRecord {
@@ -30,6 +35,8 @@ export class EntityRecord {
   @Prop({ type: String, enum: deviceCategories }) category?: string;
   @Prop({ type: String }) deviceTypeId?: string;
   @Prop({ type: String }) code?: string;
+  @Prop({ type: Number, enum: activityLevels }) activityLevel?: number;
+  @Prop({ type: Date }) activityUpdatedAt?: Date;
 }
 
 export type EntityDocument = HydratedDocument<EntityRecord>;
@@ -80,6 +87,41 @@ export class GraphSettingsRecord {
 
 export type GraphSettingsDocument = HydratedDocument<GraphSettingsRecord>;
 export const GraphSettingsSchema = SchemaFactory.createForClass(GraphSettingsRecord);
+
+@Schema({ collection: 'entity_feedbacks', timestamps: true, strict: 'throw', versionKey: false })
+export class EntityFeedbackRecord {
+  @Prop({ type: String, required: true }) _id: string;
+  @Prop({ type: String, required: true }) projectId: string;
+  @Prop({ type: String, required: true }) entityId: string;
+  @Prop({ type: String, required: true, enum: feedbackKinds }) kind: FeedbackKind;
+  @Prop({ type: String }) rootFeedbackId?: string;
+  @Prop({ type: String, trim: true, maxlength: 5000 }) content?: string;
+  @Prop({ type: String, trim: true, maxlength: 50 }) authorName?: string;
+  @Prop({ type: String, enum: feedbackStatuses }) status?: FeedbackStatus;
+  @Prop({ type: Number, default: 1, min: 1 }) revision: number;
+}
+
+export type EntityFeedbackDocument = HydratedDocument<EntityFeedbackRecord>;
+export const EntityFeedbackSchema = SchemaFactory.createForClass(EntityFeedbackRecord);
+EntityFeedbackSchema.index({ projectId: 1, entityId: 1, kind: 1, createdAt: -1, _id: -1 });
+EntityFeedbackSchema.index({ projectId: 1, entityId: 1, rootFeedbackId: 1, createdAt: 1, _id: 1 });
+
+@Schema({ collection: 'feedback_attachments', timestamps: true, strict: 'throw', versionKey: false })
+export class FeedbackAttachmentRecord {
+  @Prop({ type: String, required: true }) _id: string;
+  @Prop({ type: String, required: true }) projectId: string;
+  @Prop({ type: String, required: true }) entityId: string;
+  @Prop({ type: String, required: true }) feedbackId: string;
+  @Prop({ type: MongooseSchema.Types.ObjectId, required: true }) gridFsFileId: Types.ObjectId;
+  @Prop({ type: String, required: true, trim: true, maxlength: 255 }) fileName: string;
+  @Prop({ type: String, required: true, enum: ['image/jpeg', 'image/png', 'image/webp'] }) mimeType: string;
+  @Prop({ type: Number, required: true, min: 1, max: 10485760 }) size: number;
+}
+
+export type FeedbackAttachmentDocument = HydratedDocument<FeedbackAttachmentRecord>;
+export const FeedbackAttachmentSchema = SchemaFactory.createForClass(FeedbackAttachmentRecord);
+FeedbackAttachmentSchema.index({ projectId: 1, entityId: 1, feedbackId: 1, createdAt: 1 });
+FeedbackAttachmentSchema.index({ gridFsFileId: 1 }, { unique: true, partialFilterExpression: { gridFsFileId: { $type: 'objectId' } } });
 
 @Schema({ collection: 'migration_runs', timestamps: true, strict: 'throw', versionKey: false })
 export class MigrationRunRecord {

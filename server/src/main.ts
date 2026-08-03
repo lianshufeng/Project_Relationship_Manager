@@ -9,7 +9,7 @@ import { AppModule } from './app.module.js';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { bodyParser: false });
-  app.useBodyParser('json', { limit: '10mb' });
+  app.useBodyParser('json', { limit: '300mb' });
   app.setGlobalPrefix('api');
   app.enableVersioning({ type: VersioningType.URI, defaultVersion: '1' });
   app.use(helmet({ contentSecurityPolicy: false }));

@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ApartmentOutlined, AppstoreOutlined, BankOutlined, BuildOutlined, CameraOutlined, CarOutlined, DeleteOutlined,
+  ApartmentOutlined, AppstoreOutlined, BankOutlined, BuildOutlined, CameraOutlined, CarOutlined, CheckCircleOutlined, CommentOutlined, DeleteOutlined, ExclamationCircleOutlined,
   DownloadOutlined, EditOutlined, EnvironmentOutlined, ExpandOutlined, ExportOutlined, FileTextOutlined,
-  FullscreenOutlined, HolderOutlined, IdcardOutlined, ImportOutlined, LeftOutlined, PlusOutlined, ReloadOutlined, RightOutlined,
+  FullscreenOutlined, HolderOutlined, IdcardOutlined, ImportOutlined, LeftOutlined, PictureOutlined, PlusOutlined, ReloadOutlined, RightOutlined,
   SafetyCertificateOutlined, SearchOutlined, TeamOutlined, ToolOutlined, UserOutlined, VideoCameraOutlined,
 } from '@ant-design/icons';
 import {
@@ -12,13 +12,13 @@ import {
 import dagre from 'dagre';
 import { toPng } from 'html-to-image';
 import {
-  Alert, App as AntApp, Button, Card, Divider, Drawer, Dropdown, Empty, Form, Input, Modal, Popconfirm,
-  Result, Select, Space, Spin, Tabs, Tag, Tooltip, Tree, Typography,
+  Alert, App as AntApp, Button, Card, Divider, Drawer, Dropdown, Empty, Form, Image, Input, Modal, Pagination, Popconfirm, Popover,
+  Result, Select, Slider, Space, Spin, Tabs, Tag, Tooltip, Tree, Typography,
 } from 'antd';
 import type { DataNode } from 'antd/es/tree';
 import { entityLabels, isProjectData, normalizeProjectData, relationColors, relationLabels } from './data';
 import { ErrorBoundary } from './ErrorBoundary';
-import type { Entity, EntityType, ProjectRelationshipData, Relation, RelationType } from './types';
+import type { Entity, EntityType, FeedbackPage, FeedbackRecord, ProjectRelationshipData, Relation, RelationType } from './types';
 import { collectionByType } from './types';
 
 const { Text, Title } = Typography;
@@ -26,11 +26,40 @@ const typeColors: Record<EntityType, string> = { project: '#1677ff', team: '#36c
 const deviceCategoryLabels: Record<string, string> = { wearable: '人工佩戴设备', machinery: '机械绑定设备', mobile: '移动设备', fixed: '固定设备' };
 const apiBase = '/api/v1';
 const narrowViewportQuery = '(max-width: 900px)';
+function isActivityEntity(type: EntityType) { return type === 'product' || type === 'device'; }
+function normalizedActivity(value: number | undefined) { return Math.round(Math.max(0, Math.min(100, Number.isFinite(value) ? value! : 0)) / 10) * 10; }
+function activityLabel(value: number | undefined) {
+  const level = normalizedActivity(value);
+  if (level === 0) return '从未使用';
+  if (level < 25) return '很少使用';
+  if (level < 50) return '低频使用';
+  if (level < 75) return '一般使用';
+  if (level < 100) return '经常使用';
+  return '正常使用';
+}
+function activityColor(value: number | undefined) {
+  const level = normalizedActivity(value);
+  if (level === 0) return '#65778a';
+  const ratio = level / 100;
+  return `hsl(142 ${12 + 82 * ratio ** 1.65}% ${31 + 28 * ratio ** 2.2}%)`;
+}
+function ActivitySignal({ level, compact = false }: { level: number | undefined; compact?: boolean }) {
+  const value = normalizedActivity(level);
+  const color = activityColor(value);
+  const glow = Math.max(0, (value - 65) / 35) ** 2;
+  return <span className={`activity-signal ${compact ? 'compact' : ''}`} style={{ '--activity-color': color, '--activity-angle': `${value * 3.6}deg`, '--activity-core-opacity': .24 + .76 * (value / 100) ** 1.8, '--activity-shadow': glow ? `0 0 ${5 + glow * 14}px color-mix(in srgb, ${color} ${45 + glow * 45}%, transparent)` : 'none' } as React.CSSProperties}><i /><span>{value}%</span></span>;
+}
+function ActivitySegments({ level }: { level: number | undefined }) {
+  const value = normalizedActivity(level);
+  const activeCount = value === 0 ? 0 : Math.max(1, Math.round(value / 10));
+  return <span className="activity-segments" aria-label={`使用状态评估指示灯，点亮 ${activeCount} 格，共 10 格`} style={{ '--activity-color': activityColor(value) } as React.CSSProperties}>{Array.from({ length: 10 }, (_, index) => <i key={index} className={index < activeCount ? 'active' : ''} />)}</span>;
+}
 
 async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
+  const isFormData = options?.body instanceof FormData;
   const response = await fetch(`${apiBase}${path}`, {
     ...options,
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    headers: { ...(!isFormData ? { 'Content-Type': 'application/json' } : {}), ...options?.headers },
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: '请求失败' })) as { message?: string | string[] };
@@ -46,16 +75,36 @@ const iconMap: Record<string, React.ReactNode> = {
   EnvironmentOutlined: <EnvironmentOutlined />, AppstoreOutlined: <AppstoreOutlined />, FileTextOutlined: <FileTextOutlined />,
   VideoCameraOutlined: <VideoCameraOutlined />,
 };
+const iconLabels: Record<string, string> = { BankOutlined: '项目部', ApartmentOutlined: '组织架构', TeamOutlined: '团队', UserOutlined: '人员', IdcardOutlined: '身份标识', SafetyCertificateOutlined: '安全', BuildOutlined: '建设', ToolOutlined: '工具', CarOutlined: '车辆', EnvironmentOutlined: '位置', AppstoreOutlined: '应用', FileTextOutlined: '文档', VideoCameraOutlined: '摄像头' };
+const iconOptions = Object.entries(iconLabels).map(([value, label]) => ({ value, label }));
 
-interface GraphNodeData extends Record<string, unknown> { entityType: EntityType; name: string; icon: string; subtitle: string; count: number; selected: boolean; dimmed: boolean }
+function IconPicker({ value, onChange }: { value?: string; onChange?: (value: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const current = value && iconMap[value] ? value : 'AppstoreOutlined';
+  return <Popover open={open} onOpenChange={setOpen} trigger="click" placement="bottomLeft" arrow={false} content={<div className="icon-picker-grid">{iconOptions.map(option => <Tooltip key={option.value} title={option.label}><button type="button" className={option.value === current ? 'selected' : ''} aria-label={option.label} aria-pressed={option.value === current} onClick={() => { onChange?.(option.value); setOpen(false); }}>{iconMap[option.value]}</button></Tooltip>)}</div>}>
+    <button type="button" className="icon-picker-trigger" aria-label={`更换图标，当前为${iconLabels[current]}`} title="点击更换图标">{iconMap[current]}<span className="icon-picker-edit-badge"><EditOutlined /></span></button>
+  </Popover>;
+}
+
+function PendingFeedbackImage({ file, onRemove }: { file: File; onRemove: () => void }) {
+  const [previewUrl, setPreviewUrl] = useState('');
+  useEffect(() => {
+    const nextUrl = URL.createObjectURL(file);
+    setPreviewUrl(nextUrl);
+    return () => URL.revokeObjectURL(nextUrl);
+  }, [file]);
+  return <div className="feedback-pending-image"><Image src={previewUrl} alt={file.name} width={64} height={64} /><Button danger type="text" size="small" aria-label={`移除图片 ${file.name}`} icon={<DeleteOutlined />} onClick={onRemove} /></div>;
+}
+
+interface GraphNodeData extends Record<string, unknown> { entityType: EntityType; name: string; icon: string; subtitle: string; count: number; totalFeedbacks: number; unansweredFeedbacks: number; activityLevel: number; activityUpdatedAt?: string; selected: boolean; dimmed: boolean }
 
 function EntityNode({ data }: { data: GraphNodeData }) {
   const color = typeColors[data.entityType];
-  return <Tooltip title={<><div>{data.name}</div><div>{data.subtitle} · {data.count} 项关联</div></>} placement="top" mouseEnterDelay={.35}><div className={`entity-node ${data.selected ? 'selected' : ''} ${data.dimmed ? 'dimmed' : ''}`} style={{ '--node-color': color } as React.CSSProperties}>
+  return <Tooltip title={<><div>{data.name}</div><div>{data.subtitle} · {data.count} 项关联</div>{isActivityEntity(data.entityType) && <div>使用状态评估：{data.activityLevel}% · {activityLabel(data.activityLevel)}</div>}{data.totalFeedbacks > 0 && <div>{data.totalFeedbacks} 条反馈{data.unansweredFeedbacks > 0 ? ` · ${data.unansweredFeedbacks} 条待跟进` : ''}</div>}</>} placement="top" mouseEnterDelay={.35}><div className={`entity-node ${data.selected ? 'selected' : ''} ${data.dimmed ? 'dimmed' : ''}`} style={{ '--node-color': color } as React.CSSProperties}>
     <Handle type="target" position={FlowPosition.Left} />
     <div className="node-icon">{iconMap[data.icon] ?? <AppstoreOutlined />}</div>
     <div className="node-main">
-      <div className="node-kicker">{entityLabels[data.entityType]}</div>
+      <div className="node-kicker-row"><div className="node-kicker">{entityLabels[data.entityType]}</div><div className="node-kicker-actions">{isActivityEntity(data.entityType) && <ActivitySignal level={data.activityLevel} compact />}{data.totalFeedbacks > 0 && <div className="feedback-node-badges"><span title={`${data.totalFeedbacks} 条反馈`}><CommentOutlined />{data.totalFeedbacks}</span>{data.unansweredFeedbacks > 0 && <span className="unanswered" title={`${data.unansweredFeedbacks} 条反馈尚无处理记录`}><ExclamationCircleOutlined />{data.unansweredFeedbacks}</span>}</div>}</div></div>
       <div className="node-name">{data.name}</div>
       <div className="node-meta">{data.subtitle} · {data.count} 项关联</div>
     </div>
@@ -89,7 +138,10 @@ function graphElements(data: ProjectRelationshipData, selectedId: string | null,
   const visibleIds = filter === 'all' || (filter === 'selected' && !selectedId) ? null : new Set(relations.flatMap(rel => [rel.sourceId, rel.targetId]));
   const nodes: Node<GraphNodeData>[] = allEntities(data).filter(({ entity }) => !visibleIds || visibleIds.has(entity.id)).map(({ type, entity }) => {
     const subtitle = type === 'person' ? (data.positions.find(p => 'positionIds' in entity && entity.positionIds.includes(p.id))?.name ?? '未分配岗位') : type === 'device' ? (() => { const deviceType = data.deviceTypes.find(item => item.id === ('deviceTypeId' in entity ? entity.deviceTypeId : '')); const area = data.areas.find(item => item.id === ('areaId' in entity ? entity.areaId : '')); return `${deviceType?.name ?? '未知设备'} · ${area?.name ?? deviceCategoryLabels[deviceType?.category ?? ''] ?? '未分类'}`; })() : type === 'area' ? `${data.devices.filter(device => device.areaId === entity.id).length} 台设备` : entityLabels[type];
-    return { id: entity.id, type: 'entity', position: data.settings.positions[entity.id] ?? { x: 0, y: 0 }, data: { entityType: type, name: entity.name, icon: entityIconName(data, type, entity), subtitle, count: data.relations.filter(r => r.sourceId === entity.id || r.targetId === entity.id).length, selected: entity.id === selectedId, dimmed: !!selectedId && !related.has(entity.id) } };
+    const feedbackSummary = data.feedbackSummaries?.[entity.id] || { total: 0, unanswered: 0 };
+    const activityLevel = 'activityLevel' in entity ? normalizedActivity(entity.activityLevel) : 0;
+    const activityUpdatedAt = 'activityUpdatedAt' in entity ? entity.activityUpdatedAt : undefined;
+    return { id: entity.id, type: 'entity', position: data.settings.positions[entity.id] ?? { x: 0, y: 0 }, data: { entityType: type, name: entity.name, icon: entityIconName(data, type, entity), subtitle, count: data.relations.filter(r => r.sourceId === entity.id || r.targetId === entity.id).length, totalFeedbacks: feedbackSummary.total, unansweredFeedbacks: feedbackSummary.unanswered, activityLevel, activityUpdatedAt, selected: entity.id === selectedId, dimmed: !!selectedId && !related.has(entity.id) } };
   });
   const edges: Edge[] = relations.map(rel => ({ id: rel.id, source: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.targetId : rel.sourceId, target: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.sourceId : rel.targetId, label: rel.relationType === 'installed_in' ? '安装设备' : rel.relationType === 'holds_position' ? '任职人员' : (rel.label ?? relationLabels[rel.relationType]), animated: selectedId === rel.sourceId || selectedId === rel.targetId, style: { stroke: relationColors[rel.relationType], strokeWidth: selectedId === rel.sourceId || selectedId === rel.targetId ? 2.6 : 1.2, opacity: selectedId && rel.sourceId !== selectedId && rel.targetId !== selectedId ? .12 : .72, strokeDasharray: ['binds_to', 'manages', 'covers'].includes(rel.relationType) ? '6 4' : undefined }, labelStyle: { fill: '#9fb3c8', fontSize: 10 }, labelBgStyle: { fill: '#07192c', fillOpacity: .86 }, markerEnd: { type: MarkerType.ArrowClosed, color: relationColors[rel.relationType] } }));
   return { nodes, edges };
@@ -110,6 +162,8 @@ function AppContent() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const editMode = true;
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedEntityDetail, setSelectedEntityDetail] = useState<Entity | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [selectedRelation, setSelectedRelation] = useState<string | null>(null);
   const [filter, setFilter] = useState('deviceChain');
   const [leftPanelVisible, setLeftPanelVisible] = useState(() => !window.matchMedia(narrowViewportQuery).matches);
@@ -117,11 +171,13 @@ function AppContent() {
   const [managerOpen, setManagerOpen] = useState(false);
   const [managerTab, setManagerTab] = useState<EntityType>('team');
   const [editor, setEditor] = useState<{ type: EntityType; item?: Entity } | null>(null);
+  const [nodeContextMenu, setNodeContextMenu] = useState<{ type: EntityType; entity: Entity; x: number; y: number } | null>(null);
   const [relationEditor, setRelationEditor] = useState<Partial<Relation> | null>(null);
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   const [clearConfirmText, setClearConfirmText] = useState('');
   const [form] = Form.useForm();
   const [relationForm] = Form.useForm();
+  const editorIcon = Form.useWatch('icon', form);
   const fileRef = useRef<HTMLInputElement>(null);
   const flowRef = useRef<ReactFlowInstance<Node<GraphNodeData>, Edge> | null>(null);
 
@@ -130,7 +186,7 @@ function AppContent() {
     if (!projects.length) return null;
     const value: unknown = await apiRequest(`/projects/${projects[0].id}/graph`, { cache: 'no-store' });
     if (!isProjectData(value)) throw new Error('项目数据文件结构无效');
-    if (value.dataRevision !== 16) throw new Error('项目数据版本不匹配');
+    if (value.dataRevision !== 17) throw new Error('项目数据版本不匹配');
     return normalizeProjectData(value);
   }, []);
 
@@ -153,9 +209,20 @@ function AppContent() {
   }, [loadStoredFile, message]);
 
   const elements = useMemo(() => data ? graphElements(data, selectedId, filter) : { nodes: [], edges: [] }, [data, selectedId, filter]);
+  const graphLayoutSignature = useMemo(() => JSON.stringify([data?.settings.layoutDirection, elements.nodes.map(node => node.id), elements.edges.map(edge => [edge.id, edge.source, edge.target])]), [data?.settings.layoutDirection, elements.edges, elements.nodes]);
+  const previousGraphLayoutSignature = useRef('');
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>(elements.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(elements.edges);
-  useEffect(() => { const placed = layout(elements.nodes, elements.edges, data?.settings.layoutDirection ?? 'LR').map(node => ({ ...node, position: data?.settings.positions[node.id] ?? node.position })); setNodes(placed); setEdges(elements.edges); }, [data?.settings.layoutDirection, data?.settings.positions, elements, setEdges, setNodes]);
+  useEffect(() => {
+    const shouldLayout = previousGraphLayoutSignature.current !== graphLayoutSignature;
+    previousGraphLayoutSignature.current = graphLayoutSignature;
+    setNodes(currentNodes => {
+      const currentPositions = new Map(currentNodes.map(node => [node.id, node.position]));
+      const nextNodes = shouldLayout ? layout(elements.nodes, elements.edges, data?.settings.layoutDirection ?? 'LR') : elements.nodes;
+      return nextNodes.map(node => ({ ...node, position: data?.settings.positions[node.id] ?? currentPositions.get(node.id) ?? node.position }));
+    });
+    setEdges(elements.edges);
+  }, [data?.settings.layoutDirection, data?.settings.positions, elements, graphLayoutSignature, setEdges, setNodes]);
   useEffect(() => { const timer = window.setTimeout(() => flowRef.current?.fitView({ padding: .12, duration: 350 }), 260); return () => window.clearTimeout(timer); }, [leftPanelVisible, rightPanelVisible]);
   useEffect(() => {
     const media = window.matchMedia(narrowViewportQuery);
@@ -165,14 +232,36 @@ function AppContent() {
     media.addEventListener('change', handleViewportChange);
     return () => media.removeEventListener('change', handleViewportChange);
   }, []);
+  useEffect(() => {
+    if (!nodeContextMenu) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest('.node-context-menu')) setNodeContextMenu(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setNodeContextMenu(null); };
+    document.addEventListener('pointerdown', closeMenu);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => { document.removeEventListener('pointerdown', closeMenu); document.removeEventListener('keydown', closeOnEscape); };
+  }, [nodeContextMenu]);
 
   const update = useCallback((next: ProjectRelationshipData) => { setData(next); }, []);
   const performLayout = async () => { if (!data) return; const placed = layout(nodes, edges, data.settings.layoutDirection); setNodes(placed); try { await apiRequest(`/projects/${data.project.id}/layouts`, { method: 'PATCH', body: JSON.stringify({ positions: placed.map(node => ({ entityId: node.id, x: node.position.x, y: node.position.y })) }) }); const positions = { ...data.settings.positions, ...Object.fromEntries(placed.map(node => [node.id, node.position])) }; setData({ ...data, settings: { ...data.settings, positions } }); message.success('自动布局已同步'); } catch (error) { message.error(error instanceof Error ? error.message : '自动布局同步失败'); } requestAnimationFrame(() => flowRef.current?.fitView({ padding: .14, duration: 500 })); };
   const toggleLeftPanel = () => setLeftPanelVisible(visible => { const next = !visible; if (next && window.matchMedia(narrowViewportQuery).matches) setRightPanelVisible(false); return next; });
   const toggleRightPanel = () => setRightPanelVisible(visible => { const next = !visible; if (next && window.matchMedia(narrowViewportQuery).matches) setLeftPanelVisible(false); return next; });
   const entityIndex = useMemo(() => new Map((data ? allEntities(data) : []).map(item => [item.entity.id, item])), [data]);
-  const selected = selectedId ? entityIndex.get(selectedId) : undefined;
+  const selectedBase = selectedId ? entityIndex.get(selectedId) : undefined;
+  const selected = selectedBase ? { ...selectedBase, entity: selectedEntityDetail?.id === selectedId ? { ...selectedBase.entity, ...selectedEntityDetail } as Entity : selectedBase.entity } : undefined;
   const selectedRel = data?.relations.find(rel => rel.id === selectedRelation);
+  useEffect(() => {
+    if (!data || !selectedId) { setSelectedEntityDetail(null); setDetailLoading(false); return; }
+    let cancelled = false;
+    setSelectedEntityDetail(null);
+    setDetailLoading(true);
+    void apiRequest<Entity>(`/projects/${data.project.id}/entities/${selectedId}`, { cache: 'no-store' })
+      .then(entity => { if (!cancelled) setSelectedEntityDetail(entity); })
+      .catch(error => { if (!cancelled) message.error(error instanceof Error ? error.message : '实体详情载入失败'); })
+      .finally(() => { if (!cancelled) setDetailLoading(false); });
+    return () => { cancelled = true; };
+  }, [data?.project.id, message, selectedId]);
 
   const treeData = useMemo<DataNode[]>(() => {
     if (!data) return [];
@@ -215,7 +304,7 @@ function AppContent() {
   const populateEntityForm = () => {
     if (!editor) return;
     form.resetFields();
-    const defaults: Record<string, unknown> = { name: '', icon: 'AppstoreOutlined', sort: 99, projectId: data?.project.id };
+    const defaults: Record<string, unknown> = { name: '', icon: 'AppstoreOutlined', sort: 99, projectId: data?.project.id, activityLevel: 0 };
     const values = editor.item ? { ...editor.item } : defaults;
     if (editor.type === 'device' && editor.item && data) {
       const installation = data.relations.find(rel => rel.sourceType === 'device' && rel.sourceId === editor.item?.id && rel.targetType === 'area' && rel.relationType === 'installed_in');
@@ -229,7 +318,18 @@ function AppContent() {
     }
     form.setFieldsValue(values);
   };
-  const openEditor = (type: EntityType, item?: Entity) => { setEditor({ type, item }); };
+  const openEditor = async (type: EntityType, item?: Entity) => {
+    try {
+      const loaded = item && data
+        ? selectedEntityDetail?.id === item.id ? selectedEntityDetail : await apiRequest<Entity>(`/projects/${data.project.id}/entities/${item.id}`, { cache: 'no-store' })
+        : item;
+      const detail = item && loaded ? { ...item, ...loaded } as Entity : loaded;
+      form.setFieldValue('icon', detail && 'icon' in detail ? detail.icon : 'AppstoreOutlined');
+      setEditor({ type, item: detail });
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '实体详情载入失败');
+    }
+  };
   const saveEntity = async () => {
     if (!data || !editor) return;
     const values = await form.validateFields();
@@ -238,11 +338,12 @@ function AppContent() {
       const endpoint = editor.item
         ? `/projects/${data.project.id}/entities/${editor.item.id}`
         : `/projects/${data.project.id}/entities`;
-      await apiRequest(endpoint, {
+      const saved = await apiRequest<Entity>(endpoint, {
         method: editor.item ? 'PATCH' : 'POST',
         body: JSON.stringify({ ...payload, entityType: editor.type }),
       });
       setData(await loadStoredFile());
+      if (selectedId === saved.id) setSelectedEntityDetail(saved);
       setEditor(null);
       message.success(editor.item ? '实体已更新并同步' : '实体已新增并同步');
     } catch (error) {
@@ -297,15 +398,20 @@ function AppContent() {
           <Button className="panel-toggle panel-toggle-right" shape="circle" size="small" aria-label={rightPanelVisible ? '隐藏详情面板' : '显示详情面板'} icon={rightPanelVisible ? <RightOutlined /> : <LeftOutlined />} onClick={toggleRightPanel} />
         </Tooltip>
         <div className="graph-caption"><div><Text className="eyebrow">RELATIONSHIP CANVAS</Text><strong>{filter === 'all' ? '全域关系视图' : filter === 'deviceChain' ? '设备业务全链路' : filter === 'area' ? '区域设备部署视图' : '聚焦关系视图'}</strong></div><div className="legend">{(['uses', 'installed_in', 'supports', 'binds_to'] as RelationType[]).map(type => <span key={type}><i style={{ background: relationColors[type] }} />{relationLabels[type]}</span>)}</div></div>
-        <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onInit={instance => { flowRef.current = instance; setTimeout(() => instance.fitView({ padding: .1 }), 80); }} onNodeClick={(_, node) => { setSelectedId(node.id); setSelectedRelation(null); }} onNodeDoubleClick={(_, node) => { const item = entityIndex.get(node.id); if (item) openEditor(item.type, item.entity); }} onEdgeClick={(_, edge) => { setSelectedRelation(edge.id); setSelectedId(null); }} onConnect={onConnect} nodesConnectable nodesDraggable onPaneClick={() => { setSelectedId(null); setSelectedRelation(null); }} onNodeDragStop={(_, node) => { if (!data) return; const next = { ...data, settings: { ...data.settings, positions: { ...data.settings.positions, [node.id]: node.position } } }; update(next); void apiRequest(`/projects/${data.project.id}/layouts/${node.id}`, { method: 'PATCH', body: JSON.stringify(node.position) }).catch(error => message.error(error instanceof Error ? error.message : '节点布局同步失败')); }} minZoom={.08} maxZoom={2.4} fitView>
+        <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onInit={instance => { flowRef.current = instance; setTimeout(() => instance.fitView({ padding: .1 }), 80); }} onNodeClick={(_, node) => { setNodeContextMenu(null); setSelectedId(node.id); setSelectedRelation(null); }} onNodeContextMenu={(event, node) => { event.preventDefault(); const item = entityIndex.get(node.id); if (!item) return; const menuWidth = 176; const menuHeight = 128; setNodeContextMenu({ type: item.type, entity: item.entity, x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)) }); window.requestAnimationFrame(() => window.requestAnimationFrame(() => startTransition(() => { setSelectedId(node.id); setSelectedRelation(null); }))); }} onEdgeClick={(_, edge) => { setNodeContextMenu(null); setSelectedRelation(edge.id); setSelectedId(null); }} onConnect={onConnect} nodesConnectable nodesDraggable onPaneClick={() => { setNodeContextMenu(null); setSelectedId(null); setSelectedRelation(null); }} onNodeDragStop={(_, node) => { if (!data) return; const next = { ...data, settings: { ...data.settings, positions: { ...data.settings.positions, [node.id]: node.position } } }; update(next); void apiRequest(`/projects/${data.project.id}/layouts/${node.id}`, { method: 'PATCH', body: JSON.stringify(node.position) }).catch(error => message.error(error instanceof Error ? error.message : '节点布局同步失败')); }} minZoom={.08} maxZoom={2.4} fitView>
           <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="rgba(84,151,255,.18)" /><MiniMap nodeColor={node => typeColors[(node.data as GraphNodeData).entityType]} maskColor="rgba(4,15,28,.74)" /><Controls />
         </ReactFlow>
+        {nodeContextMenu && <div className="node-context-menu" role="menu" style={{ left: nodeContextMenu.x, top: nodeContextMenu.y }}>
+          <div className="node-context-menu-title">{nodeContextMenu.entity.name}</div>
+          <button type="button" role="menuitem" onClick={() => { const current = nodeContextMenu; setNodeContextMenu(null); openEditor(current.type, current.entity); }}><EditOutlined /><span>编辑</span></button>
+          <button type="button" role="menuitem" className="danger" disabled={nodeContextMenu.type === 'project'} title={nodeContextMenu.type === 'project' ? '项目部不能直接删除' : undefined} onClick={() => { const current = nodeContextMenu; setNodeContextMenu(null); deleteEntity(current.type, current.entity.id); }}><DeleteOutlined /><span>删除</span></button>
+        </div>}
         {!nodes.length && <Empty className="graph-empty" description="暂无关系数据" />}
       </section>
 
       <aside className={`right-panel panel ${rightPanelVisible ? '' : 'is-collapsed'}`} aria-hidden={!rightPanelVisible}>
         <div className="panel-heading"><div><Text className="eyebrow">INSPECTOR</Text><Title level={5}>{selected ? '实体详情' : selectedRel ? '关系详情' : '详情'}</Title></div></div>
-        {selected ? <EntityDetails data={data} type={selected.type} entity={selected.entity} onLocate={locate} onEdit={() => openEditor(selected.type, selected.entity)} editMode={editMode} onAddRelation={() => openRelationEditor({ sourceId: selected.entity.id, sourceType: selected.type })} onDeleteRelation={deleteRelation} onReorderRelations={(draggedId, targetId) => reorderEntityRelations(selected.entity.id, draggedId, targetId)} /> : selectedRel ? <RelationDetails data={data} relation={selectedRel} index={entityIndex} editMode={editMode} onEdit={() => openRelationEditor(selectedRel)} onDelete={() => deleteRelation(selectedRel.id)} /> : <div className="detail-placeholder"><div className="orbit"><span /></div><Title level={5}>选择任意节点</Title><Text>查看区域内安装设备、设备信息、责任组织及产品能力。点击节点后，无关关系会自动淡化。</Text></div>}
+        {selected ? <EntityDetails data={data} type={selected.type} entity={selected.entity} detailLoading={detailLoading} onLocate={locate} onEdit={() => void openEditor(selected.type, selected.entity)} editMode={editMode} onAddRelation={() => openRelationEditor({ sourceId: selected.entity.id, sourceType: selected.type })} onDeleteRelation={deleteRelation} onReorderRelations={(draggedId, targetId) => reorderEntityRelations(selected.entity.id, draggedId, targetId)} onActivityChanged={(entityId, level, updatedAt) => { setSelectedEntityDetail(current => current?.id === entityId ? { ...current, activityLevel: level, activityUpdatedAt: updatedAt } as Entity : current); setData(current => { if (!current) return current; if (selected.type === 'product') return { ...current, products: current.products.map(item => item.id === entityId ? { ...item, activityLevel: level, activityUpdatedAt: updatedAt } : item) }; if (selected.type === 'device') return { ...current, devices: current.devices.map(item => item.id === entityId ? { ...item, activityLevel: level, activityUpdatedAt: updatedAt } : item) }; return current; }); }} onFeedbackChanged={async () => { const latest = await loadStoredFile(); if (latest) setData(latest); }} /> : selectedRel ? <RelationDetails data={data} relation={selectedRel} index={entityIndex} editMode={editMode} onEdit={() => openRelationEditor(selectedRel)} onDelete={() => deleteRelation(selectedRel.id)} /> : <div className="detail-placeholder"><div className="orbit"><span /></div><Title level={5}>选择任意节点</Title><Text>查看区域内安装设备、设备信息、责任组织及产品能力。点击节点后，无关关系会自动淡化。</Text></div>}
       </aside>
     </main>
 
@@ -314,7 +420,7 @@ function AppContent() {
       <div className="entity-list">{managerList.map(entity => <Card key={entity.id} size="small"><div className="entity-list-row"><div className="list-icon" style={{ color: typeColors[managerTab] }}>{iconMap[entityIconName(data, managerTab, entity)] ?? <AppstoreOutlined />}</div><div className="list-content"><strong>{entity.name}</strong><Text>{entity.id}</Text></div>{editMode && <Space><Button type="text" icon={<EditOutlined />} onClick={() => openEditor(managerTab, entity)} /><Popconfirm title="确定删除？" onConfirm={() => deleteEntity(managerTab, entity.id)}><Button danger type="text" icon={<DeleteOutlined />} /></Popconfirm></Space>}</div></Card>)}</div>
     </Drawer>
 
-    <Modal title={`${editor?.item ? '编辑' : '新增'}${editor ? entityLabels[editor.type] : ''}`} open={!!editor} onCancel={() => setEditor(null)} onOk={() => void saveEntity()} afterOpenChange={open => { if (open) populateEntityForm(); }} okText="保存" cancelText="取消" destroyOnHidden>
+    <Modal title={<div className="entity-modal-title">{editor && editor.type !== 'device' && <IconPicker value={editorIcon} onChange={value => form.setFieldValue('icon', value)} />}<span>{`${editor?.item ? '编辑' : '新增'}${editor ? entityLabels[editor.type] : ''}`}</span></div>} open={!!editor} onCancel={() => setEditor(null)} onOk={() => void saveEntity()} afterOpenChange={open => { if (open) populateEntityForm(); }} okText="保存" cancelText="取消" destroyOnHidden>
       {editor && <EntityForm form={form} type={editor.type} data={data} />}
     </Modal>
     <Modal title={relationEditor?.id ? '编辑关系' : '新增关系'} open={!!relationEditor} onCancel={() => setRelationEditor(null)} onOk={() => void saveRelation()} afterOpenChange={open => { if (open && relationEditor) { relationForm.resetFields(); relationForm.setFieldsValue(relationEditor); } }} okText="保存关系" cancelText="取消" destroyOnHidden>
@@ -336,13 +442,12 @@ function AppContent() {
 }
 
 function EntityForm({ form, type, data }: { form: ReturnType<typeof Form.useForm>[0]; type: EntityType; data: ProjectRelationshipData }) {
-  const iconOptions = ['BankOutlined', 'ApartmentOutlined', 'TeamOutlined', 'UserOutlined', 'IdcardOutlined', 'SafetyCertificateOutlined', 'BuildOutlined', 'ToolOutlined', 'CarOutlined', 'EnvironmentOutlined', 'AppstoreOutlined', 'FileTextOutlined', 'VideoCameraOutlined'].map(value => ({ value, label: value }));
   const selectedDeviceTypeId = Form.useWatch('deviceTypeId', form);
   const currentProductId = Form.useWatch('id', form);
   const isFixedDevice = data.deviceTypes.find(item => item.id === selectedDeviceTypeId)?.category === 'fixed';
   return <Form form={form} layout="vertical" preserve={false}>
+    {type !== 'device' && <Form.Item name="icon" hidden><Input /></Form.Item>}
     <Form.Item name="name" label={type === 'project' ? '项目名称' : '名称'} rules={[{ required: true, message: '请输入名称' }]}><Input autoFocus /></Form.Item>
-    {type !== 'device' && <Form.Item name="icon" label="图标"><Select showSearch options={iconOptions} optionRender={option => <Space>{iconMap[String(option.value)]}{option.label}</Space>} /></Form.Item>}
     {type === 'team' && <><Form.Item name="type" label="团队类型" rules={[{ required: true }]}><Select options={['project_management', 'construction', 'supervision', 'owner', 'design', 'subcontractor', 'other'].map(value => ({ value, label: value }))} /></Form.Item><Form.Item name="parentId" label="上级团队"><Select allowClear options={data.teams.map(team => ({ value: team.id, label: team.name }))} /></Form.Item><Form.Item name="projectId" hidden><Input /></Form.Item><Form.Item name="sort" hidden><Input /></Form.Item></>}
     {type === 'position' && <><Form.Item name="projectId" label="所属项目部" rules={[{ required: true }]}><Select options={[{ value: data.project.id, label: data.project.name }]} /></Form.Item><Form.Item name="teamId" label="所属团队（属性）"><Select allowClear options={data.teams.map(team => ({ value: team.id, label: team.name }))} /></Form.Item><Form.Item name="sort" hidden><Input /></Form.Item></>}
     {type === 'person' && <><Form.Item name="positionIds" label="担任岗位" rules={[{ required: true, type: 'array', min: 1, message: '人员必须至少属于一个岗位' }]}><Select mode="multiple" options={data.positions.map(position => ({ value: position.id, label: position.name }))} /></Form.Item><Form.Item name="phone" label="联系电话"><Input /></Form.Item></>}
@@ -355,23 +460,210 @@ function EntityForm({ form, type, data }: { form: ReturnType<typeof Form.useForm
   </Form>;
 }
 
-function EntityDetails({ data, type, entity, onLocate, onEdit, editMode, onAddRelation, onDeleteRelation, onReorderRelations }: { data: ProjectRelationshipData; type: EntityType; entity: Entity; onLocate: (id: string) => void; onEdit: () => void; editMode: boolean; onAddRelation: () => void; onDeleteRelation: (relationId: string) => void; onReorderRelations: (draggedId: string, targetId: string) => void }) {
+function EntityFeedbackSection({ projectId, entityId, onChanged }: { projectId: string; entityId: string; onChanged: () => Promise<void> }) {
+  const { message, modal } = AntApp.useApp();
+  const [feedbackForm] = Form.useForm();
+  const [feedbackPage, setFeedbackPage] = useState<FeedbackPage>({ items: [], total: 0, page: 1, pageSize: 5 });
+  const [page, setPage] = useState(1);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editor, setEditor] = useState<{ record?: FeedbackRecord; rootId?: string } | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
+  const [removedAttachmentIds, setRemovedAttachmentIds] = useState<string[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const loadFeedbacks = useCallback(async (targetPage: number) => {
+    setLoading(true);
+    try {
+      const result = await apiRequest<FeedbackPage>(`/projects/${projectId}/entities/${entityId}/feedbacks?page=${targetPage}&pageSize=5`, { cache: 'no-store' });
+      setFeedbackPage(result);
+      if (!result.items.length && result.total && targetPage > 1) setPage(targetPage - 1);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '反馈记录加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [entityId, message, projectId]);
+
+  useEffect(() => { setPage(1); }, [entityId, projectId]);
+  useEffect(() => { void loadFeedbacks(page); }, [loadFeedbacks, page]);
+
+  const openCreate = (rootId?: string) => {
+    setEditor({ rootId });
+    setFiles([]);
+    setRemovedAttachmentIds([]);
+    feedbackForm.resetFields();
+    feedbackForm.setFieldsValue({ authorName: window.localStorage.getItem('feedbackAuthorName') || '' });
+  };
+  const openEdit = (record: FeedbackRecord, rootId?: string) => {
+    setEditor({ record, rootId });
+    setFiles([]);
+    setRemovedAttachmentIds([]);
+    feedbackForm.resetFields();
+    feedbackForm.setFieldsValue({ authorName: record.authorName || '', content: record.content });
+  };
+  const addFiles = (selected: FileList | File[] | null) => {
+    if (!selected) return;
+    const next = [...files, ...Array.from(selected)];
+    const retainedCount = (editor?.record?.attachments.length || 0) - removedAttachmentIds.length;
+    if (next.length + retainedCount > 20) { message.warning('每条记录最多保留 20 张图片'); return; }
+    const invalid = next.find(file => !['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024);
+    if (invalid) { message.warning('仅支持不超过 10 MB 的 JPG、PNG、WebP 图片'); return; }
+    setFiles(next);
+  };
+  const pasteImages = (event: React.ClipboardEvent<HTMLElement>) => {
+    const pasted = Array.from(event.clipboardData.items).filter(item => item.kind === 'file' && item.type.startsWith('image/')).map((item, index) => {
+      const source = item.getAsFile();
+      if (!source) return null;
+      const extension = source.type === 'image/jpeg' ? 'jpg' : source.type === 'image/webp' ? 'webp' : 'png';
+      return new File([source], `剪贴板图片-${Date.now()}-${index + 1}.${extension}`, { type: source.type, lastModified: Date.now() });
+    }).filter((file): file is File => !!file);
+    if (!pasted.length) return;
+    event.preventDefault();
+    addFiles(pasted);
+  };
+  const saveFeedback = async () => {
+    if (!editor) return;
+    const values = await feedbackForm.validateFields() as { authorName?: string; content?: string };
+    const retainedCount = (editor.record?.attachments.length || 0) - removedAttachmentIds.length;
+    if (!values.content?.trim() && !files.length && !retainedCount) { message.warning('反馈内容和图片至少填写一项'); return; }
+    const formData = new FormData();
+    if (values.authorName?.trim()) formData.append('authorName', values.authorName.trim());
+    if (values.content?.trim()) formData.append('content', values.content.trim());
+    files.forEach(file => formData.append('images', file));
+    if (editor.record) {
+      formData.append('revision', String(editor.record.revision));
+      formData.append('removeAttachmentIds', JSON.stringify(removedAttachmentIds));
+    }
+    const path = editor.record
+      ? `/projects/${projectId}/entities/${entityId}/feedbacks/${editor.record.id}`
+      : editor.rootId
+        ? `/projects/${projectId}/entities/${entityId}/feedbacks/${editor.rootId}/handling-records`
+        : `/projects/${projectId}/entities/${entityId}/feedbacks`;
+    setSaving(true);
+    try {
+      await apiRequest(path, { method: editor.record ? 'PATCH' : 'POST', body: formData });
+      if (values.authorName?.trim()) window.localStorage.setItem('feedbackAuthorName', values.authorName.trim());
+      else window.localStorage.removeItem('feedbackAuthorName');
+      setEditor(null);
+      message.success(editor.record ? '记录已更新' : editor.rootId ? '处理记录已添加' : '反馈已发布');
+      await loadFeedbacks(page);
+      await onChanged();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '反馈保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+  const deleteFeedback = (record: FeedbackRecord) => {
+    modal.confirm({
+      title: record.kind === 'feedback' ? '删除这条反馈？' : '删除这条处理记录？',
+      content: record.kind === 'feedback' ? '该反馈下的全部处理记录和图片也会一并删除，此操作无法撤回。' : '关联图片也会一并删除，此操作无法撤回。',
+      okText: '删除', cancelText: '取消', okButtonProps: { danger: true },
+      onOk: async () => {
+        await apiRequest(`/projects/${projectId}/entities/${entityId}/feedbacks/${record.id}`, { method: 'DELETE' });
+        message.success('记录已删除');
+        await loadFeedbacks(page);
+        await onChanged();
+      },
+    });
+  };
+  const formatTime = (value: string) => new Date(value).toLocaleString('zh-CN', { hour12: false });
+  const attachments = editor?.record?.attachments || [];
+  const renderImages = (record: FeedbackRecord) => record.attachments.length ? <Image.PreviewGroup><div className="feedback-images">{record.attachments.map(item => <Image key={item.id} src={item.url} alt={item.fileName} width={58} height={58} />)}</div></Image.PreviewGroup> : null;
+
+  return <section className="feedback-section">
+    <div className="detail-section-heading"><span /><strong>反馈记录 · {feedbackPage.total}</strong><span /><Tooltip title="新增反馈"><Button className="section-add-button" type="text" shape="circle" size="small" aria-label="新增反馈" icon={<PlusOutlined />} onClick={() => openCreate()} /></Tooltip></div>
+    <Spin spinning={loading}>
+      <div className="feedback-list">{feedbackPage.items.length ? feedbackPage.items.map(record => <Card key={record.id} size="small" className="feedback-card">
+        <div className="feedback-card-head"><strong>{record.authorName || '未填写'}</strong><Tag color={record.handlingRecords?.length ? 'success' : 'warning'} icon={record.handlingRecords?.length ? <CheckCircleOutlined /> : undefined}>{record.handlingRecords?.length ? '已处理' : '待处理'}</Tag></div>
+        <Text className="feedback-time">{formatTime(record.createdAt)}{record.updatedAt !== record.createdAt ? ' · 已编辑' : ''}</Text>
+        {record.content && <div className="feedback-content">{record.content}</div>}
+        {renderImages(record)}
+        <div className="feedback-actions"><Button type="link" size="small" onClick={() => openCreate(record.id)}>添加处理记录</Button><Button type="link" size="small" onClick={() => openEdit(record)}>编辑</Button><Button danger type="link" size="small" onClick={() => deleteFeedback(record)}>删除</Button></div>
+        {!!record.handlingRecords?.length && <div className="handling-list"><div className="handling-list-title"><span>处理进展</span><small>{record.handlingRecords.length} 条</small></div>{record.handlingRecords.map(handling => <div className="handling-record" key={handling.id}>
+          <i className="handling-dot" />
+          <div className="handling-head"><div className="handling-person"><span>处理</span><strong>{handling.authorName || '未填写'}</strong></div><Text>{formatTime(handling.createdAt)}{handling.updatedAt !== handling.createdAt ? ' · 已编辑' : ''}</Text></div>
+          {handling.content && <div className="feedback-content">{handling.content}</div>}
+          {renderImages(handling)}
+          <div className="handling-actions"><Button type="link" size="small" onClick={() => openEdit(handling, record.id)}>编辑</Button><Button danger type="link" size="small" onClick={() => deleteFeedback(handling)}>删除</Button></div>
+        </div>)}</div>}
+      </Card>) : !loading && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无反馈" />}</div>
+    </Spin>
+    {feedbackPage.total > feedbackPage.pageSize && <Pagination className="feedback-pagination" simple size="small" current={page} pageSize={feedbackPage.pageSize} total={feedbackPage.total} onChange={setPage} />}
+    <Modal title={editor?.record ? (editor.record.kind === 'feedback' ? '编辑反馈' : '编辑处理记录') : editor?.rootId ? '添加处理记录' : '新增反馈'} open={!!editor} confirmLoading={saving} onCancel={() => setEditor(null)} onOk={() => void saveFeedback()} okText="保存" cancelText="取消" destroyOnHidden>
+      <Form form={feedbackForm} layout="vertical" preserve={false}>
+        <Form.Item name="authorName" label="记录人（选填）" rules={[{ max: 50 }]}><Input maxLength={50} /></Form.Item>
+        <Form.Item name="content" label="内容" rules={[{ max: 5000, message: '内容不能超过 5000 字' }]}><Input.TextArea rows={5} maxLength={5000} showCount onPaste={pasteImages} /></Form.Item>
+        <Form.Item label="图片（最多 20 张，单张不超过 10 MB）">
+          <input ref={fileInputRef} className="feedback-file-input" type="file" hidden multiple accept="image/jpeg,image/png,image/webp" onChange={event => { addFiles(event.target.files); event.target.value = ''; }} />
+          <div className="feedback-upload-trigger" role="button" tabIndex={0} contentEditable suppressContentEditableWarning aria-label="选择或粘贴图片" onPaste={pasteImages} onClick={() => fileInputRef.current?.click()} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); fileInputRef.current?.click(); } else if (!((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'v')) event.preventDefault(); }}><PictureOutlined /><span><strong>选择或粘贴图片</strong><small>点击选择，或在内容框按 Ctrl+V、右键粘贴图片</small></span></div>
+          {!!attachments.length && <div className="feedback-edit-images">{attachments.map(item => <div key={item.id} className={removedAttachmentIds.includes(item.id) ? 'removed' : ''}><Image src={item.url} alt={item.fileName} width={56} height={56} preview={false} /><Button danger type="link" size="small" onClick={() => setRemovedAttachmentIds(current => current.includes(item.id) ? current.filter(id => id !== item.id) : [...current, item.id])}>{removedAttachmentIds.includes(item.id) ? '恢复' : '移除'}</Button></div>)}</div>}
+          {!!files.length && <div className="feedback-pending-images">{files.map((file, index) => <PendingFeedbackImage key={`${file.name}-${file.lastModified}-${index}`} file={file} onRemove={() => setFiles(current => current.filter((_, fileIndex) => fileIndex !== index))} />)}</div>}
+        </Form.Item>
+      </Form>
+    </Modal>
+  </section>;
+}
+
+function EntityDetails({ data, type, entity, detailLoading, onLocate, onEdit, editMode, onAddRelation, onDeleteRelation, onReorderRelations, onActivityChanged, onFeedbackChanged }: { data: ProjectRelationshipData; type: EntityType; entity: Entity; detailLoading: boolean; onLocate: (id: string) => void; onEdit: () => void; editMode: boolean; onAddRelation: () => void; onDeleteRelation: (relationId: string) => void; onReorderRelations: (draggedId: string, targetId: string) => void; onActivityChanged: (entityId: string, level: number, updatedAt?: string) => void; onFeedbackChanged: () => Promise<void> }) {
+  const { message } = AntApp.useApp();
   const relations = data.relations.filter(rel => rel.sourceId === entity.id || rel.targetId === entity.id);
   const index = new Map(allEntities(data).map(item => [item.entity.id, item]));
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
-  return <div className="detail-content"><Button className="entity-detail-edit" icon={<EditOutlined />} onClick={onEdit}>编辑</Button><div className="detail-icon" style={{ color: typeColors[type] }}>{iconMap[entityIconName(data, type, entity)] ?? <AppstoreOutlined />}</div><Tag color={typeColors[type]}>{entityLabels[type]}</Tag><Title level={4}>{entity.name}</Title>{'description' in entity && entity.description && <Text>{entity.description}</Text>}
+  const activityLevel = 'activityLevel' in entity ? normalizedActivity(entity.activityLevel) : 0;
+  const [activityDraft, setActivityDraft] = useState(activityLevel);
+  const activitySaveTimers = useRef(new Map<string, number>());
+  const activitySaveQueue = useRef<Promise<void>>(Promise.resolve());
+  const persistedActivityLevels = useRef(new Map([[entity.id, activityLevel]]));
+  const latestActivityTarget = useRef({ entityId: entity.id, level: activityLevel });
+  useEffect(() => {
+    setActivityDraft(activityLevel);
+    latestActivityTarget.current = { entityId: entity.id, level: activityLevel };
+    persistedActivityLevels.current.set(entity.id, activityLevel);
+  }, [entity.id]);
+  const previewActivity = (level: number) => {
+    const value = normalizedActivity(level);
+    latestActivityTarget.current = { entityId: entity.id, level: value };
+    setActivityDraft(value);
+  };
+  const scheduleActivitySave = (level: number) => {
+    const value = normalizedActivity(level);
+    const targetEntityId = entity.id;
+    latestActivityTarget.current = { entityId: targetEntityId, level: value };
+    const existingTimer = activitySaveTimers.current.get(targetEntityId);
+    if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+    if (persistedActivityLevels.current.get(targetEntityId) === value) return;
+    const timer = window.setTimeout(() => {
+      activitySaveTimers.current.delete(targetEntityId);
+      activitySaveQueue.current = activitySaveQueue.current.then(async () => {
+        try {
+          const saved = await apiRequest<Entity>(`/projects/${data.project.id}/entities/${targetEntityId}`, { method: 'PATCH', body: JSON.stringify({ activityLevel: value }) });
+          if ('activityLevel' in saved) {
+            persistedActivityLevels.current.set(targetEntityId, normalizedActivity(saved.activityLevel));
+            onActivityChanged(targetEntityId, normalizedActivity(saved.activityLevel), saved.activityUpdatedAt);
+          }
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '使用状态评估自动保存失败');
+        }
+      });
+    }, 450);
+    activitySaveTimers.current.set(targetEntityId, timer);
+  };
+  return <div className="detail-content"><Button className="entity-detail-edit" icon={<EditOutlined />} onClick={onEdit}>编辑</Button><div className="detail-icon" style={{ color: typeColors[type] }}>{iconMap[entityIconName(data, type, entity)] ?? <AppstoreOutlined />}</div><Tag color={typeColors[type]}>{entityLabels[type]}</Tag><Title level={4}>{entity.name}</Title>{detailLoading && <Text type="secondary">正在载入完整详情…</Text>}{'description' in entity && entity.description && <Text>{entity.description}</Text>}
+    {isActivityEntity(type) && <div className="activity-detail-card" style={{ '--activity-color': activityColor(activityDraft) } as React.CSSProperties}><div className="activity-detail-head"><span><small>使用状态评估</small><strong>{activityLabel(activityDraft)}</strong></span><ActivitySignal level={activityDraft} /></div><ActivitySegments level={activityDraft} /><Slider className="activity-quick-slider" min={0} max={100} step={10} value={activityDraft} tooltip={{ formatter: value => `${value}%` }} onChange={previewActivity} onChangeComplete={scheduleActivitySave} /></div>}
     {'phone' in entity && entity.phone && <div className="detail-field"><span>联系电话</span><strong>{entity.phone}</strong></div>}
     {'address' in entity && entity.address && <div className="detail-field"><span>项目地址</span><strong>{entity.address}</strong></div>}
     {'areaId' in entity && <div className="detail-field"><span>安装区域</span><strong>{data.areas.find(area => area.id === entity.areaId)?.name ?? '未分配'}</strong></div>}
     {'code' in entity && entity.code && <div className="detail-field"><span>设备编码</span><strong>{entity.code}</strong></div>}
-    <Divider>关联对象 · {relations.length}</Divider>
+    <div className="detail-section-heading"><span /><strong>关联对象 · {relations.length}</strong><span />{editMode && <Tooltip title="新增关系"><Button className="section-add-button" type="text" shape="circle" size="small" aria-label="新增关系" icon={<PlusOutlined />} onClick={onAddRelation} /></Tooltip>}</div>
     <div className="relation-list">{relations.length ? relations.map(rel => { const otherId = rel.sourceId === entity.id ? rel.targetId : rel.sourceId; const other = index.get(otherId); const otherName = other?.entity.name ?? '未知对象'; const displayLabel = rel.relationType === 'installed_in' && rel.targetId === entity.id ? '安装设备' : rel.relationType === 'holds_position' && rel.targetId === entity.id ? '任职人员' : (rel.label ?? relationLabels[rel.relationType]); return <Tooltip key={rel.id} title={<><div>{displayLabel}</div><div>{otherName}</div></>} placement="left" mouseEnterDelay={.35}><div className={`relation-item ${draggingId === rel.id ? 'dragging' : ''} ${dragOverId === rel.id ? 'drag-over' : ''}`} draggable={editMode} onDragStart={event => { setDraggingId(rel.id); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', rel.id); }} onDragEnter={() => { if (draggingId && draggingId !== rel.id) setDragOverId(rel.id); }} onDragOver={event => { if (editMode) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; } }} onDrop={event => { event.preventDefault(); const draggedRelationId = event.dataTransfer.getData('text/plain') || draggingId; if (draggedRelationId && draggedRelationId !== rel.id) onReorderRelations(draggedRelationId, rel.id); setDraggingId(null); setDragOverId(null); }} onDragEnd={() => { setDraggingId(null); setDragOverId(null); }}>
       {editMode && <span className="relation-drag-handle" title="拖拽调整顺序"><HolderOutlined /></span>}
       <button className="relation-main" onClick={() => onLocate(otherId)}><i style={{ background: relationColors[rel.relationType] }} /><span><small>{displayLabel}</small><strong>{otherName}</strong></span><ExportOutlined /></button>
       {editMode && <Popconfirm title="删除这条关系？" description={`${displayLabel}：${otherName}`} okText="删除关系" cancelText="取消" okButtonProps={{ danger: true }} onConfirm={() => onDeleteRelation(rel.id)}><Button className="relation-delete" danger type="text" size="small" aria-label={`删除关系 ${otherName}`} title="删除关系" icon={<DeleteOutlined />} onClick={event => event.stopPropagation()} /></Popconfirm>}
     </div></Tooltip>; }) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无关联" />}</div>
-    {editMode && <div className="detail-actions"><Button type="primary" icon={<PlusOutlined />} onClick={onAddRelation}>新增关系</Button></div>}
+    <EntityFeedbackSection projectId={data.project.id} entityId={entity.id} onChanged={onFeedbackChanged} />
   </div>;
 }
 

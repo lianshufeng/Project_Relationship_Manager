@@ -1,11 +1,13 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectConnection, InjectModel } from '@nestjs/mongoose';
 import { randomUUID } from 'node:crypto';
 import type { ClientSession, Connection, Model } from 'mongoose';
+import type { ObjectId } from 'mongodb';
 import {
-  EntityRecord, GraphLayoutRecord, GraphSettingsRecord, RelationRecord,
+  EntityFeedbackRecord, EntityRecord, FeedbackAttachmentRecord, GraphLayoutRecord, GraphSettingsRecord, RelationRecord,
   type EntityType, type RelationType,
 } from '../database/schemas.js';
+import { deleteFeedbackImages, readFeedbackImage, uploadFeedbackImage } from '../database/feedback-gridfs.js';
 import type {
   CreateProjectDto, EntityMutationDto, LayoutPositionDto, RelationMutationDto,
   UpdateGraphSettingsDto,
@@ -13,6 +15,8 @@ import type {
 
 type PlainEntity = EntityRecord & { createdAt?: Date; updatedAt?: Date };
 type PlainRelation = RelationRecord & { createdAt?: Date; updatedAt?: Date };
+type ImportedAttachment = { _id: string; projectId: string; entityId: string; feedbackId: string; fileName: string; mimeType: string; size: number; data: Buffer };
+type StoredImportedAttachment = Omit<ImportedAttachment, 'data'> & { gridFsFileId: ObjectId };
 
 const labels: Record<RelationType, string> = {
   contains: '包含', belongs_to: '属于', holds_position: '担任', uses: '使用', depends_on: '依赖',
@@ -21,11 +25,14 @@ const labels: Record<RelationType, string> = {
 
 @Injectable()
 export class ProjectDataService {
+  private readonly logger = new Logger(ProjectDataService.name);
   constructor(
     @InjectModel(EntityRecord.name) private readonly entities: Model<EntityRecord>,
     @InjectModel(RelationRecord.name) private readonly relations: Model<RelationRecord>,
     @InjectModel(GraphLayoutRecord.name) private readonly layouts: Model<GraphLayoutRecord>,
     @InjectModel(GraphSettingsRecord.name) private readonly settings: Model<GraphSettingsRecord>,
+    @InjectModel(EntityFeedbackRecord.name) private readonly feedbacks: Model<EntityFeedbackRecord>,
+    @InjectModel(FeedbackAttachmentRecord.name) private readonly feedbackAttachments: Model<FeedbackAttachmentRecord>,
     @InjectConnection() private readonly connection: Connection,
   ) {}
 
@@ -54,22 +61,41 @@ export class ProjectDataService {
 
   async deleteProject(projectId: string) {
     await this.ensureProject(projectId);
-    const deleted = { entityCount: 0, relationCount: 0, layoutCount: 0, settingsCount: 0 };
+    const deleted = { entityCount: 0, relationCount: 0, layoutCount: 0, settingsCount: 0, feedbackCount: 0, feedbackAttachmentCount: 0 };
+    const fileIds = (await this.feedbackAttachments.find({ projectId }).select({ gridFsFileId: 1 }).lean().exec()).map(item => item.gridFsFileId);
     await this.connection.transaction(async session => {
+      deleted.feedbackAttachmentCount = (await this.feedbackAttachments.deleteMany({ projectId }).session(session)).deletedCount;
+      deleted.feedbackCount = (await this.feedbacks.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.relationCount = (await this.relations.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.layoutCount = (await this.layouts.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.settingsCount = (await this.settings.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.entityCount = (await this.entities.deleteMany({ projectId }).session(session)).deletedCount;
     });
+    await this.cleanupGridFs(fileIds);
     return { message: '当前项目数据已清空', ...deleted };
   }
 
-  async getGraph(projectId: string) {
-    const [entityRows, relationRows, layoutRows, graphSettings] = await Promise.all([
-      this.entities.find({ projectId }).sort({ entityType: 1, sort: 1 }).lean().exec(),
-      this.relations.find({ projectId }).sort({ sort: 1, _id: 1 }).lean().exec(),
-      this.layouts.find({ projectId }).lean().exec(),
-      this.settings.findOne({ projectId }).lean().exec(),
+  async getGraph(projectId: string, includeEntityDetails = false) {
+    const entityQuery = this.entities.find({ projectId }).sort({ entityType: 1, sort: 1 });
+    if (!includeEntityDetails) {
+      entityQuery.select({
+        _id: 1, projectId: 1, entityType: 1, name: 1, icon: 1, color: 1, sort: 1,
+        parentId: 1, teamType: 1, teamId: 1, category: 1, deviceTypeId: 1, activityLevel: 1, activityUpdatedAt: 1,
+      });
+    }
+    const [entityRows, relationRows, layoutRows, graphSettings, feedbackSummaryRows] = await Promise.all([
+      entityQuery.lean().exec(),
+      this.relations.find({ projectId }).select({ _id: 1, sourceEntityId: 1, targetEntityId: 1, relationType: 1, label: 1 }).sort({ sort: 1, _id: 1 }).lean().exec(),
+      this.layouts.find({ projectId }).select({ entityId: 1, x: 1, y: 1 }).lean().exec(),
+      this.settings.findOne({ projectId }).select({ layoutDirection: 1, zoom: 1, viewportX: 1, viewportY: 1 }).lean().exec(),
+      this.feedbacks.aggregate<{ _id: string; total: number; unanswered: number }>([
+        { $match: { projectId, kind: 'feedback' } },
+        { $group: {
+          _id: '$entityId',
+          total: { $sum: 1 },
+          unanswered: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+        } },
+      ]).exec(),
     ]);
     const entities = entityRows as PlainEntity[];
     const relations = relationRows as PlainRelation[];
@@ -89,37 +115,42 @@ export class ProjectDataService {
     const byType = <T>(type: EntityType, map: (entity: PlainEntity) => T) => entities.filter(entity => entity.entityType === type).map(map);
     return {
       schemaVersion: '1.0',
-      dataRevision: 16,
+      dataRevision: 17,
       project: {
-        id: project._id, name: project.name, shortName: project.shortName, address: project.address,
-        description: project.description, icon: project.icon || 'BankOutlined',
+        id: project._id, name: project.name, icon: project.icon || 'BankOutlined',
+        ...(includeEntityDetails ? { shortName: project.shortName, address: project.address, description: project.description } : {}),
       },
       teams: byType('team', entity => ({
         id: entity._id, projectId, parentId: entity.parentId, name: entity.name, type: entity.teamType || '',
-        icon: entity.icon || 'TeamOutlined', color: entity.color, sort: entity.sort, description: entity.description,
+        icon: entity.icon || 'TeamOutlined', color: entity.color, sort: entity.sort,
+        ...(includeEntityDetails ? { description: entity.description } : {}),
       })),
       positions: byType('position', entity => ({
         id: entity._id, projectId, teamId: entity.teamId, name: entity.name,
-        icon: entity.icon || 'IdcardOutlined', color: entity.color, sort: entity.sort, description: entity.description,
+        icon: entity.icon || 'IdcardOutlined', color: entity.color, sort: entity.sort,
+        ...(includeEntityDetails ? { description: entity.description } : {}),
       })),
       persons: byType('person', entity => ({
-        id: entity._id, name: entity.name, phone: entity.phone, avatar: entity.avatar,
-        icon: entity.icon || 'UserOutlined', positionIds: holdsByPerson.get(entity._id) || [], description: entity.description,
+        id: entity._id, name: entity.name, icon: entity.icon || 'UserOutlined', positionIds: holdsByPerson.get(entity._id) || [],
+        ...(includeEntityDetails ? { phone: entity.phone, avatar: entity.avatar, description: entity.description } : {}),
       })),
       products: byType('product', entity => ({
-        id: entity._id, name: entity.name, icon: entity.icon || 'AppstoreOutlined',
-        color: entity.color, description: entity.description,
+        id: entity._id, name: entity.name, icon: entity.icon || 'AppstoreOutlined', color: entity.color,
+        activityLevel: entity.activityLevel ?? 0, activityUpdatedAt: entity.activityUpdatedAt,
+        ...(includeEntityDetails ? { description: entity.description } : {}),
       })),
       deviceTypes: byType('deviceType', entity => ({
-        id: entity._id, name: entity.name, category: entity.category || '', icon: entity.icon || 'ToolOutlined',
-        color: entity.color, description: entity.description,
+        id: entity._id, name: entity.name, category: entity.category || '', icon: entity.icon || 'ToolOutlined', color: entity.color,
+        ...(includeEntityDetails ? { description: entity.description } : {}),
       })),
       devices: byType('device', entity => ({
-        id: entity._id, deviceTypeId: entity.deviceTypeId || '', areaId: areaByDevice.get(entity._id),
-        name: entity.name, code: entity.code, description: entity.description,
+        id: entity._id, deviceTypeId: entity.deviceTypeId || '', areaId: areaByDevice.get(entity._id), name: entity.name,
+        activityLevel: entity.activityLevel ?? 0, activityUpdatedAt: entity.activityUpdatedAt,
+        ...(includeEntityDetails ? { code: entity.code, description: entity.description } : {}),
       })),
       areas: byType('area', entity => ({
-        id: entity._id, projectId, name: entity.name, icon: entity.icon || 'EnvironmentOutlined', description: entity.description,
+        id: entity._id, projectId, name: entity.name, icon: entity.icon || 'EnvironmentOutlined',
+        ...(includeEntityDetails ? { description: entity.description } : {}),
       })),
       relations: relations.map(relation => ({
         id: relation._id,
@@ -130,6 +161,7 @@ export class ProjectDataService {
         relationType: relation.relationType,
         label: relation.label,
       })),
+      feedbackSummaries: Object.fromEntries(feedbackSummaryRows.filter(item => item.total > 0).map(item => [item._id, { total: item.total, unanswered: item.unanswered }])),
       settings: {
         layoutDirection: graphSettings?.layoutDirection || 'LR',
         positions: Object.fromEntries(layoutRows.map(layout => [layout.entityId, { x: layout.x, y: layout.y }])),
@@ -140,21 +172,68 @@ export class ProjectDataService {
     };
   }
 
+  async exportProject(projectId: string) {
+    const [graph, feedbackRows, attachmentRows] = await Promise.all([
+      this.getGraph(projectId, true),
+      this.feedbacks.find({ projectId }).sort({ createdAt: 1, _id: 1 }).lean().exec(),
+      this.feedbackAttachments.find({ projectId }).sort({ createdAt: 1, _id: 1 }).lean().exec(),
+    ]);
+    const exportedAttachments = await Promise.all(attachmentRows.map(async attachment => ({
+      id: attachment._id,
+      feedbackId: attachment.feedbackId,
+      fileName: attachment.fileName,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+      dataBase64: (await readFeedbackImage(this.database(), attachment.gridFsFileId)).toString('base64'),
+    })));
+    const attachmentsByFeedback = new Map<string, typeof exportedAttachments>();
+    for (const attachment of exportedAttachments) {
+      attachmentsByFeedback.set(attachment.feedbackId, [...(attachmentsByFeedback.get(attachment.feedbackId) || []), attachment]);
+    }
+    return {
+      ...graph,
+      feedbacks: feedbackRows.map(record => ({
+        id: record._id,
+        entityId: record.entityId,
+        kind: record.kind,
+        rootFeedbackId: record.rootFeedbackId,
+        content: record.content,
+        authorName: record.authorName,
+        status: record.status,
+        revision: record.revision,
+        createdAt: (record as typeof record & { createdAt?: Date }).createdAt,
+        updatedAt: (record as typeof record & { updatedAt?: Date }).updatedAt,
+        attachments: (attachmentsByFeedback.get(record._id) || []).map(attachment => ({
+          id: attachment.id,
+          fileName: attachment.fileName,
+          mimeType: attachment.mimeType,
+          size: attachment.size,
+          dataBase64: attachment.dataBase64,
+        })),
+      })),
+    };
+  }
+
   async importGraph(projectId: string, value: Record<string, unknown>) {
     const project = value.project as Record<string, unknown> | undefined;
     const collections = ['teams', 'positions', 'persons', 'products', 'deviceTypes', 'devices', 'areas', 'relations'] as const;
-    if (value.schemaVersion !== '1.0' || value.dataRevision !== 16 || !project || project.id !== projectId || typeof project.name !== 'string' || !project.name.trim() || collections.some(key => !Array.isArray(value[key]))) {
+    if (value.schemaVersion !== '1.0' || (value.dataRevision !== 16 && value.dataRevision !== 17) || !project || project.id !== projectId || typeof project.name !== 'string' || !project.name.trim() || collections.some(key => !Array.isArray(value[key]))) {
       throw new BadRequestException('导入配置结构无效或项目 ID 不匹配');
     }
     const rows = <T extends Record<string, unknown>>(key: typeof collections[number]) => value[key] as T[];
+    const unsupportedActivityRows = [project, ...rows('teams'), ...rows('positions'), ...rows('persons'), ...rows('deviceTypes'), ...rows('areas')];
+    if (unsupportedActivityRows.some(item => item.activityLevel !== undefined || item.activityUpdatedAt !== undefined)) {
+      throw new BadRequestException('只有设备和系统可以设置使用状态评估值');
+    }
+    const requireActivityLevel = value.dataRevision === 17;
     const entities: Array<Record<string, unknown> & { _id: string }> = [
       { _id: projectId, projectId, entityType: 'project', name: project.name, shortName: project.shortName, address: project.address, description: project.description, icon: project.icon || 'BankOutlined', sort: 0, revision: 1 },
       ...rows('teams').map(item => ({ _id: String(item.id), projectId, entityType: 'team', name: item.name, parentId: item.parentId, teamType: item.type, icon: item.icon, color: item.color, sort: item.sort ?? 99, description: item.description, revision: 1 })),
       ...rows('positions').map(item => ({ _id: String(item.id), projectId, entityType: 'position', name: item.name, teamId: item.teamId, icon: item.icon, color: item.color, sort: item.sort ?? 99, description: item.description, revision: 1 })),
       ...rows('persons').map(item => ({ _id: String(item.id), projectId, entityType: 'person', name: item.name, phone: item.phone, avatar: item.avatar, icon: item.icon, description: item.description, sort: 99, revision: 1 })),
-      ...rows('products').map(item => ({ _id: String(item.id), projectId, entityType: 'product', name: item.name, icon: item.icon, color: item.color, description: item.description, sort: 99, revision: 1 })),
+      ...rows('products').map(item => ({ _id: String(item.id), projectId, entityType: 'product', name: item.name, icon: item.icon, color: item.color, description: item.description, sort: 99, revision: 1, ...this.parseImportedActivity(item, requireActivityLevel) })),
       ...rows('deviceTypes').map(item => ({ _id: String(item.id), projectId, entityType: 'deviceType', name: item.name, category: item.category, icon: item.icon, color: item.color, description: item.description, sort: 99, revision: 1 })),
-      ...rows('devices').map(item => ({ _id: String(item.id), projectId, entityType: 'device', name: item.name, deviceTypeId: item.deviceTypeId, code: item.code, description: item.description, sort: 99, revision: 1 })),
+      ...rows('devices').map(item => ({ _id: String(item.id), projectId, entityType: 'device', name: item.name, deviceTypeId: item.deviceTypeId, code: item.code, description: item.description, sort: 99, revision: 1, ...this.parseImportedActivity(item, requireActivityLevel) })),
       ...rows('areas').map(item => ({ _id: String(item.id), projectId, entityType: 'area', name: item.name, icon: item.icon, description: item.description, sort: 99, revision: 1 })),
     ];
     const relations = rows('relations').map((item, sort) => ({
@@ -170,21 +249,33 @@ export class ProjectDataService {
     if (relations.some(relation => !ids.has(relation.sourceEntityId) || !ids.has(relation.targetEntityId))) {
       throw new BadRequestException('导入配置包含孤立关系');
     }
-
-    await this.connection.transaction(async session => {
-      await this.relations.deleteMany({ projectId }).session(session);
-      await this.layouts.deleteMany({ projectId }).session(session);
-      await this.settings.deleteMany({ projectId }).session(session);
-      await this.entities.deleteMany({ projectId }).session(session);
-      await this.entities.insertMany(entities, { session });
-      await this.relations.insertMany(relations, { session });
-      if (layouts.length) await this.layouts.insertMany(layouts, { session });
-      await this.settings.create([{
-        _id: projectId, projectId, layoutDirection: settings.layoutDirection || 'LR',
-        zoom: settings.zoom, viewportX: settings.viewportX, viewportY: settings.viewportY,
-      }], { session });
-    });
-    return { message: '项目配置已导入', entityCount: entities.length, relationCount: relations.length, layoutCount: layouts.length };
+    const imported = this.parseImportedFeedbacks(projectId, value.feedbacks, ids);
+    const oldFileIds = (await this.feedbackAttachments.find({ projectId }).select({ gridFsFileId: 1 }).lean().exec()).map(item => item.gridFsFileId);
+    const storedAttachments = await this.storeImportedAttachments(imported.attachments);
+    try {
+      await this.connection.transaction(async session => {
+        await this.feedbackAttachments.deleteMany({ projectId }).session(session);
+        await this.feedbacks.deleteMany({ projectId }).session(session);
+        await this.relations.deleteMany({ projectId }).session(session);
+        await this.layouts.deleteMany({ projectId }).session(session);
+        await this.settings.deleteMany({ projectId }).session(session);
+        await this.entities.deleteMany({ projectId }).session(session);
+        await this.entities.insertMany(entities, { session });
+        await this.relations.insertMany(relations, { session });
+        if (imported.feedbacks.length) await this.feedbacks.insertMany(imported.feedbacks, { session });
+        if (storedAttachments.length) await this.feedbackAttachments.insertMany(storedAttachments, { session });
+        if (layouts.length) await this.layouts.insertMany(layouts, { session });
+        await this.settings.create([{
+          _id: projectId, projectId, layoutDirection: settings.layoutDirection || 'LR',
+          zoom: settings.zoom, viewportX: settings.viewportX, viewportY: settings.viewportY,
+        }], { session });
+      });
+    } catch (error) {
+      await this.cleanupGridFs(storedAttachments.map(item => item.gridFsFileId));
+      throw error;
+    }
+    await this.cleanupGridFs(oldFileIds);
+    return { message: '项目配置已导入', entityCount: entities.length, relationCount: relations.length, layoutCount: layouts.length, feedbackCount: imported.feedbacks.length, feedbackAttachmentCount: imported.attachments.length };
   }
 
   async listEntities(projectId: string, entityType?: EntityType) {
@@ -203,6 +294,7 @@ export class ProjectDataService {
     await this.ensureProject(projectId);
     if (!dto.entityType || dto.entityType === 'project') throw new BadRequestException('请选择有效的实体类型');
     if (!dto.name?.trim()) throw new BadRequestException('实体名称不能为空');
+    if (dto.activityLevel !== undefined && !['product', 'device'].includes(dto.entityType)) throw new BadRequestException('只有设备和系统可以设置使用状态评估值');
     const entityId = dto.id || `${dto.entityType}-${randomUUID()}`;
 
     await this.connection.transaction(async session => {
@@ -220,7 +312,9 @@ export class ProjectDataService {
       const current = await this.entities.findOne({ _id: entityId, projectId }).session(session).lean().exec() as PlainEntity | null;
       if (!current) throw new NotFoundException('实体不存在');
       if (dto.entityType && dto.entityType !== current.entityType) throw new BadRequestException('实体类型不可修改');
-      const patch = this.buildEntityPatch(current.entityType, dto);
+      if (dto.activityLevel !== undefined && !['product', 'device'].includes(current.entityType)) throw new BadRequestException('只有设备和系统可以设置使用状态评估值');
+      const patch: Partial<PlainEntity> = this.buildEntityPatch(current.entityType, dto);
+      if (dto.activityLevel !== undefined && dto.activityLevel !== (current.activityLevel ?? 0)) patch.activityUpdatedAt = new Date();
       await this.validateEntityStructure(projectId, { ...current, ...patch }, session);
       result = await this.entities.findOneAndUpdate(
         { _id: entityId, projectId }, { $set: patch, $inc: { revision: 1 } },
@@ -232,6 +326,7 @@ export class ProjectDataService {
   }
 
   async deleteEntity(projectId: string, entityId: string) {
+    let fileIds: ObjectId[] = [];
     await this.connection.transaction(async session => {
       const entity = await this.entities.findOne({ _id: entityId, projectId }).session(session).lean().exec() as PlainEntity | null;
       if (!entity) throw new NotFoundException('实体不存在');
@@ -249,9 +344,16 @@ export class ProjectDataService {
         throw new ConflictException('区域内仍有固定设备');
       }
       await this.entities.deleteOne({ _id: entityId, projectId }).session(session);
+      const feedbackIds = (await this.feedbacks.find({ projectId, entityId }).session(session).select({ _id: 1 }).lean().exec()).map(item => item._id);
+      if (feedbackIds.length) {
+        fileIds = (await this.feedbackAttachments.find({ projectId, entityId, feedbackId: { $in: feedbackIds } }).session(session).select({ gridFsFileId: 1 }).lean().exec()).map(item => item.gridFsFileId);
+        await this.feedbackAttachments.deleteMany({ projectId, entityId, feedbackId: { $in: feedbackIds } }).session(session);
+      }
+      await this.feedbacks.deleteMany({ projectId, entityId }).session(session);
       await this.relations.deleteMany({ projectId, $or: [{ sourceEntityId: entityId }, { targetEntityId: entityId }] }).session(session);
       await this.layouts.deleteOne({ projectId, entityId }).session(session);
     });
+    await this.cleanupGridFs(fileIds);
     return { message: '实体及关联数据已删除' };
   }
 
@@ -361,10 +463,13 @@ export class ProjectDataService {
   }
 
   private buildEntity(projectId: string, entityId: string, entityType: EntityType, dto: EntityMutationDto) {
+    const activity = ['product', 'device'].includes(entityType)
+      ? { activityLevel: dto.activityLevel ?? 0, ...(dto.activityLevel !== undefined ? { activityUpdatedAt: new Date() } : {}) }
+      : {};
     return {
       _id: entityId, projectId, entityType, revision: 1,
       name: dto.name!.trim(), icon: entityType === 'device' ? undefined : dto.icon || 'AppstoreOutlined',
-      ...this.buildEntityPatch(entityType, dto),
+      ...this.buildEntityPatch(entityType, dto), ...activity,
     };
   }
 
@@ -376,7 +481,8 @@ export class ProjectDataService {
       : entityType === 'position' ? this.pick(dto, ['teamId'] as const)
       : entityType === 'person' ? this.pick(dto, ['phone', 'avatar'] as const)
       : entityType === 'deviceType' ? this.pick(dto, ['category'] as const)
-      : entityType === 'device' ? this.pick(dto, ['deviceTypeId', 'code'] as const)
+      : entityType === 'product' ? this.pick(dto, ['activityLevel'] as const)
+      : entityType === 'device' ? this.pick(dto, ['deviceTypeId', 'code', 'activityLevel'] as const)
       : {};
     return { ...common, ...icon, ...typed };
   }
@@ -514,5 +620,114 @@ export class ProjectDataService {
   private async ensureEntity(projectId: string, entityId: string) {
     const entity = await this.entities.exists({ _id: entityId, projectId });
     if (!entity) throw new NotFoundException('实体不存在');
+  }
+
+  private parseImportedFeedbacks(projectId: string, value: unknown, entityIds: Set<string>): { feedbacks: Array<Record<string, unknown> & { _id: string; entityId: string; kind: string; rootFeedbackId?: string }>; attachments: ImportedAttachment[] } {
+    if (!Array.isArray(value)) throw new BadRequestException('导入配置中的反馈结构无效');
+    const feedbacks: Array<Record<string, unknown> & { _id: string; entityId: string; kind: string; rootFeedbackId?: string }> = [];
+    const attachments: ImportedAttachment[] = [];
+    const feedbackIds = new Set<string>();
+    const attachmentIds = new Set<string>();
+    for (const raw of value) {
+      if (!raw || typeof raw !== 'object') throw new BadRequestException('导入配置包含无效反馈记录');
+      const item = raw as Record<string, unknown>;
+      const id = typeof item.id === 'string' ? item.id : '';
+      const entityId = typeof item.entityId === 'string' ? item.entityId : '';
+      const kind = item.kind;
+      const authorName = typeof item.authorName === 'string' ? item.authorName.trim() : '';
+      const content = typeof item.content === 'string' ? item.content.trim() : undefined;
+      const imageRows = item.attachments === undefined ? [] : item.attachments;
+      if (!id || feedbackIds.has(id) || !entityIds.has(entityId) || !['feedback', 'handling'].includes(String(kind)) || authorName.length > 50 || (content?.length || 0) > 5000 || !Array.isArray(imageRows) || imageRows.length > 20) {
+        throw new BadRequestException('导入配置包含无效反馈记录');
+      }
+      feedbackIds.add(id);
+      const rootFeedbackId = typeof item.rootFeedbackId === 'string' ? item.rootFeedbackId : undefined;
+      const createdAt = this.parseImportDate(item.createdAt);
+      const updatedAt = this.parseImportDate(item.updatedAt);
+      feedbacks.push({
+        _id: id, projectId, entityId, kind: String(kind), rootFeedbackId,
+        content, authorName, status: kind === 'feedback' && item.status === 'resolved' ? 'resolved' : kind === 'feedback' ? 'pending' : undefined,
+        revision: Number.isInteger(item.revision) && Number(item.revision) >= 1 ? Number(item.revision) : 1,
+        ...(createdAt ? { createdAt } : {}), ...(updatedAt ? { updatedAt } : {}),
+      });
+      for (const rawAttachment of imageRows) {
+        if (!rawAttachment || typeof rawAttachment !== 'object') throw new BadRequestException('导入配置包含无效反馈图片');
+        const attachment = rawAttachment as Record<string, unknown>;
+        const attachmentId = typeof attachment.id === 'string' ? attachment.id : '';
+        const fileName = typeof attachment.fileName === 'string' ? attachment.fileName : '';
+        const mimeType = typeof attachment.mimeType === 'string' ? attachment.mimeType : '';
+        const dataBase64 = typeof attachment.dataBase64 === 'string' ? attachment.dataBase64 : '';
+        if (!attachmentId || attachmentIds.has(attachmentId) || !fileName || fileName.length > 255 || !['image/jpeg', 'image/png', 'image/webp'].includes(mimeType) || !/^[A-Za-z0-9+/]*={0,2}$/.test(dataBase64)) {
+          throw new BadRequestException('导入配置包含无效反馈图片');
+        }
+        const data = Buffer.from(dataBase64, 'base64');
+        if (!data.length || data.length > 10 * 1024 * 1024 || data.length !== Number(attachment.size)) throw new BadRequestException('导入配置中的反馈图片大小无效');
+        attachmentIds.add(attachmentId);
+        attachments.push({ _id: attachmentId, projectId, entityId, feedbackId: id, fileName, mimeType, size: data.length, data });
+      }
+      if (!content && !imageRows.length) throw new BadRequestException('反馈内容和图片至少填写一项');
+    }
+    const roots = new Map(feedbacks.filter(item => item.kind === 'feedback').map(item => [item._id, item]));
+    if (feedbacks.some(item => item.kind === 'handling' && (!item.rootFeedbackId || roots.get(item.rootFeedbackId)?.entityId !== item.entityId))) {
+      throw new BadRequestException('导入配置包含无效的处理记录引用');
+    }
+    for (const root of roots.values()) root.status = feedbacks.some(item => item.kind === 'handling' && item.rootFeedbackId === root._id) ? 'resolved' : 'pending';
+    return { feedbacks, attachments };
+  }
+
+  private parseImportDate(value: unknown) {
+    if (typeof value !== 'string' && !(value instanceof Date)) return undefined;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? undefined : date;
+  }
+
+  private parseImportedActivity(item: Record<string, unknown>, required: boolean) {
+    if (item.activityLevel === undefined) {
+      if (required) throw new BadRequestException('版本 17 的设备和系统必须包含使用状态评估值');
+      return { activityLevel: 0 };
+    }
+    if (!Number.isInteger(item.activityLevel) || Number(item.activityLevel) < 0 || Number(item.activityLevel) > 100 || Number(item.activityLevel) % 10 !== 0) {
+      throw new BadRequestException('使用状态评估值必须是 0 到 100 且以 10% 为单位');
+    }
+    if (item.activityUpdatedAt === undefined) return { activityLevel: Number(item.activityLevel) };
+    const activityUpdatedAt = this.parseImportDate(item.activityUpdatedAt);
+    if (!activityUpdatedAt) throw new BadRequestException('使用状态评估时间无效');
+    return { activityLevel: Number(item.activityLevel), activityUpdatedAt };
+  }
+
+  private async storeImportedAttachments(attachments: ImportedAttachment[]) {
+    const stored: StoredImportedAttachment[] = [];
+    try {
+      for (const attachment of attachments) {
+        const gridFsFileId = await uploadFeedbackImage(this.database(), attachment.fileName, attachment.data, {
+          projectId: attachment.projectId,
+          entityId: attachment.entityId,
+          feedbackId: attachment.feedbackId,
+          attachmentId: attachment._id,
+          mimeType: attachment.mimeType,
+          size: attachment.size,
+        });
+        const { data: _data, ...metadata } = attachment;
+        stored.push({ ...metadata, gridFsFileId });
+      }
+      return stored;
+    } catch (error) {
+      await this.cleanupGridFs(stored.map(item => item.gridFsFileId));
+      throw error;
+    }
+  }
+
+  private async cleanupGridFs(fileIds: ObjectId[]) {
+    if (!fileIds.length) return;
+    try {
+      await deleteFeedbackImages(this.database(), fileIds);
+    } catch (error) {
+      this.logger.warn(`GridFS 图片清理失败，将在服务下次启动时重试孤立文件清理：${(error as Error).message}`);
+    }
+  }
+
+  private database() {
+    if (!this.connection.db) throw new Error('MongoDB 尚未连接');
+    return this.connection.db;
   }
 }
