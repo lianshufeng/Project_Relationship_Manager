@@ -3,7 +3,7 @@ import {
   ApartmentOutlined, AppstoreOutlined, BankOutlined, BuildOutlined, CameraOutlined, CarOutlined, CheckCircleOutlined, CommentOutlined, DeleteOutlined, ExclamationCircleOutlined,
   DownloadOutlined, EditOutlined, EnvironmentOutlined, ExpandOutlined, ExportOutlined, FileTextOutlined,
   FullscreenOutlined, HolderOutlined, IdcardOutlined, ImportOutlined, LeftOutlined, PictureOutlined, PlusOutlined, ReloadOutlined, RightOutlined,
-  SafetyCertificateOutlined, SearchOutlined, TeamOutlined, ToolOutlined, UserOutlined, VideoCameraOutlined,
+  SafetyCertificateOutlined, SearchOutlined, TeamOutlined, ThunderboltOutlined, ToolOutlined, UserOutlined, VideoCameraOutlined,
 } from '@ant-design/icons';
 import {
   Background, BackgroundVariant, Connection, Controls, Edge, Handle, MarkerType, MiniMap, Node,
@@ -13,12 +13,12 @@ import dagre from 'dagre';
 import { toPng } from 'html-to-image';
 import {
   Alert, App as AntApp, Button, Card, Divider, Drawer, Dropdown, Empty, Form, Image, Input, Modal, Pagination, Popconfirm, Popover,
-  Result, Select, Slider, Space, Spin, Tabs, Tag, Tooltip, Tree, Typography,
+  Result, Select, Space, Spin, Tabs, Tag, Tooltip, Tree, Typography,
 } from 'antd';
 import type { DataNode } from 'antd/es/tree';
 import { entityLabels, isProjectData, normalizeProjectData, relationColors, relationLabels } from './data';
 import { ErrorBoundary } from './ErrorBoundary';
-import type { Entity, EntityType, FeedbackPage, FeedbackRecord, ProjectRelationshipData, Relation, RelationType } from './types';
+import type { Entity, EntityType, FeedbackPage, FeedbackRecord, PersonActivityRange, PersonActivitySourceType, PersonActivitySummary, ProjectRelationshipData, Relation, RelationType } from './types';
 import { collectionByType } from './types';
 
 const { Text, Title } = Typography;
@@ -46,13 +46,38 @@ function activityColor(value: number | undefined) {
 function ActivitySignal({ level, compact = false }: { level: number | undefined; compact?: boolean }) {
   const value = normalizedActivity(level);
   const color = activityColor(value);
-  const glow = Math.max(0, (value - 65) / 35) ** 2;
-  return <span className={`activity-signal ${compact ? 'compact' : ''}`} style={{ '--activity-color': color, '--activity-angle': `${value * 3.6}deg`, '--activity-core-opacity': .24 + .76 * (value / 100) ** 1.8, '--activity-shadow': glow ? `0 0 ${5 + glow * 14}px color-mix(in srgb, ${color} ${45 + glow * 45}%, transparent)` : 'none' } as React.CSSProperties}><i /><span>{value}%</span></span>;
+  const glow = value < 70 ? 0 : .24 + .76 * ((value - 70) / 30) ** 1.7;
+  const signal = <span className={`activity-signal ${compact ? 'compact' : ''} ${value >= 70 ? 'emphasized' : ''}`} aria-label={compact ? `查看使用状态评估，当前 ${value}%` : undefined} tabIndex={compact ? 0 : undefined} style={{ '--activity-color': color, '--activity-angle': `${value * 3.6}deg`, '--activity-fill': `${Math.round(value * .26)}px`, '--activity-core-opacity': .24 + .76 * (value / 100) ** 1.8, '--activity-shadow': glow ? `0 0 ${5 + glow * 14}px color-mix(in srgb, ${color} ${45 + glow * 45}%, transparent)` : 'none' } as React.CSSProperties}><i />{!compact && <span>{value}%</span>}</span>;
+  if (!compact) return signal;
+  return <Tooltip title={<div className="activity-signal-tip"><strong>使用状态评估</strong><div><span>{activityLabel(value)}</span><b>{value}%</b></div><small>人工评估的当前使用程度</small></div>} placement="right" trigger={['hover', 'focus']} mouseEnterDelay={.08}>{signal}</Tooltip>;
 }
-function ActivitySegments({ level }: { level: number | undefined }) {
+function ActivitySegments({ level, onSelect }: { level: number | undefined; onSelect?: (level: number) => void }) {
   const value = normalizedActivity(level);
   const activeCount = value === 0 ? 0 : Math.max(1, Math.round(value / 10));
-  return <span className="activity-segments" aria-label={`使用状态评估指示灯，点亮 ${activeCount} 格，共 10 格`} style={{ '--activity-color': activityColor(value) } as React.CSSProperties}>{Array.from({ length: 10 }, (_, index) => <i key={index} className={index < activeCount ? 'active' : ''} />)}</span>;
+  return <span className={`activity-segments ${onSelect ? 'selectable' : ''}`} aria-label={`使用状态评估，当前 ${value}%`} style={{ '--activity-color': activityColor(value) } as React.CSSProperties}>{Array.from({ length: 10 }, (_, index) => {
+    const option = (index + 1) * 10;
+    return onSelect ? <button type="button" key={option} className={`${index < activeCount ? 'active' : ''} ${option === value ? 'selected' : ''}`} aria-label={`设为 ${option}%`} aria-pressed={option === value} onClick={() => onSelect(option)} /> : <i key={option} className={index < activeCount ? 'active' : ''} />;
+  })}</span>;
+}
+
+function projectToday() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
+type PersonActivityHeatItem = { sourceType: PersonActivitySourceType; name: string; activityValue: number };
+
+function PersonActivityHeat({ summary, items }: { summary?: PersonActivitySummary; items: PersonActivityHeatItem[] }) {
+  const blocks = (values: Array<{ sourceId: string; activityValue: number }> | undefined, type: PersonActivitySourceType) => {
+    const sorted = [...(values || [])].sort((a, b) => b.activityValue - a.activityValue).slice(0, 4);
+    return Array.from({ length: 4 }, (_, index) => {
+      const item = sorted[index];
+      const intensity = item ? .22 + .78 * (1 - Math.exp(-Math.log1p(item.activityValue) / 3)) : 0;
+      return <i key={item?.sourceId || `${type}-${index}`} className={item ? 'active' : ''} style={{ '--heat-intensity': intensity } as React.CSSProperties} />;
+    });
+  };
+  const activeItems = items.filter(item => item.activityValue > 0);
+  const tip = <div className="person-activity-heat-tip"><strong>今日活跃度</strong>{activeItems.length ? activeItems.map(item => <div key={`${item.sourceType}:${item.name}`}><i className={item.sourceType} /><span>{item.name}</span><b>{item.activityValue}</b></div>) : <small>暂无非零活跃值</small>}</div>;
+  return <Tooltip title={tip} placement="right" mouseEnterDelay={.08}><span className="person-activity-heat" aria-label="查看今日人员活跃度"><span className="device-lane">{blocks(summary?.deviceTypes, 'deviceType')}</span><span className="product-lane">{blocks(summary?.products, 'product')}</span></span></Tooltip>;
 }
 
 async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
@@ -96,15 +121,15 @@ function PendingFeedbackImage({ file, onRemove }: { file: File; onRemove: () => 
   return <div className="feedback-pending-image"><Image src={previewUrl} alt={file.name} width={64} height={64} /><Button danger type="text" size="small" aria-label={`移除图片 ${file.name}`} icon={<DeleteOutlined />} onClick={onRemove} /></div>;
 }
 
-interface GraphNodeData extends Record<string, unknown> { entityType: EntityType; name: string; icon: string; subtitle: string; count: number; totalFeedbacks: number; unansweredFeedbacks: number; activityLevel: number; activityUpdatedAt?: string; selected: boolean; dimmed: boolean }
+interface GraphNodeData extends Record<string, unknown> { entityType: EntityType; name: string; icon: string; subtitle: string; count: number; totalFeedbacks: number; unansweredFeedbacks: number; activityLevel: number; activityUpdatedAt?: string; todayActivity?: PersonActivitySummary; activityHeatItems: PersonActivityHeatItem[]; selected: boolean; dimmed: boolean }
 
 function EntityNode({ data }: { data: GraphNodeData }) {
   const color = typeColors[data.entityType];
-  return <Tooltip title={<><div>{data.name}</div><div>{data.subtitle} · {data.count} 项关联</div>{isActivityEntity(data.entityType) && <div>使用状态评估：{data.activityLevel}% · {activityLabel(data.activityLevel)}</div>}{data.totalFeedbacks > 0 && <div>{data.totalFeedbacks} 条反馈{data.unansweredFeedbacks > 0 ? ` · ${data.unansweredFeedbacks} 条待跟进` : ''}</div>}</>} placement="top" mouseEnterDelay={.35}><div className={`entity-node ${data.selected ? 'selected' : ''} ${data.dimmed ? 'dimmed' : ''}`} style={{ '--node-color': color } as React.CSSProperties}>
+  return <Tooltip title={<><div>{data.name}</div><div>{data.subtitle} · {data.count} 项关联</div>{data.totalFeedbacks > 0 && <div>{data.totalFeedbacks} 条反馈{data.unansweredFeedbacks > 0 ? ` · ${data.unansweredFeedbacks} 条待跟进` : ''}</div>}</>} placement="top" mouseEnterDelay={.35}><div className={`entity-node ${data.selected ? 'selected' : ''} ${data.dimmed ? 'dimmed' : ''}`} style={{ '--node-color': color } as React.CSSProperties}>
     <Handle type="target" position={FlowPosition.Left} />
     <div className="node-icon">{iconMap[data.icon] ?? <AppstoreOutlined />}</div>
     <div className="node-main">
-      <div className="node-kicker-row"><div className="node-kicker">{entityLabels[data.entityType]}</div><div className="node-kicker-actions">{isActivityEntity(data.entityType) && <ActivitySignal level={data.activityLevel} compact />}{data.totalFeedbacks > 0 && <div className="feedback-node-badges"><span title={`${data.totalFeedbacks} 条反馈`}><CommentOutlined />{data.totalFeedbacks}</span>{data.unansweredFeedbacks > 0 && <span className="unanswered" title={`${data.unansweredFeedbacks} 条反馈尚无处理记录`}><ExclamationCircleOutlined />{data.unansweredFeedbacks}</span>}</div>}</div></div>
+      <div className="node-kicker-row"><div className="node-kicker">{entityLabels[data.entityType]}</div><div className="node-kicker-actions">{isActivityEntity(data.entityType) && <ActivitySignal level={data.activityLevel} compact />}{data.entityType === 'person' && <PersonActivityHeat summary={data.todayActivity} items={data.activityHeatItems} />}{data.totalFeedbacks > 0 && <div className="feedback-node-badges"><span title={`${data.totalFeedbacks} 条反馈`}><CommentOutlined />{data.totalFeedbacks}</span>{data.unansweredFeedbacks > 0 && <span className="unanswered" title={`${data.unansweredFeedbacks} 条反馈尚无处理记录`}><ExclamationCircleOutlined />{data.unansweredFeedbacks}</span>}</div>}</div></div>
       <div className="node-name">{data.name}</div>
       <div className="node-meta">{data.subtitle} · {data.count} 项关联</div>
     </div>
@@ -141,7 +166,12 @@ function graphElements(data: ProjectRelationshipData, selectedId: string | null,
     const feedbackSummary = data.feedbackSummaries?.[entity.id] || { total: 0, unanswered: 0 };
     const activityLevel = 'activityLevel' in entity ? normalizedActivity(entity.activityLevel) : 0;
     const activityUpdatedAt = 'activityUpdatedAt' in entity ? entity.activityUpdatedAt : undefined;
-    return { id: entity.id, type: 'entity', position: data.settings.positions[entity.id] ?? { x: 0, y: 0 }, data: { entityType: type, name: entity.name, icon: entityIconName(data, type, entity), subtitle, count: data.relations.filter(r => r.sourceId === entity.id || r.targetId === entity.id).length, totalFeedbacks: feedbackSummary.total, unansweredFeedbacks: feedbackSummary.unanswered, activityLevel, activityUpdatedAt, selected: entity.id === selectedId, dimmed: !!selectedId && !related.has(entity.id) } };
+    const todayActivity = type === 'person' && 'todayActivity' in entity ? entity.todayActivity : undefined;
+    const activityHeatItems: PersonActivityHeatItem[] = type === 'person' ? [
+      ...(todayActivity?.deviceTypes || []).filter(item => item.activityValue > 0).map(item => ({ sourceType: 'deviceType' as const, name: data.deviceTypes.find(source => source.id === item.sourceId)?.name ?? '已删除设备类型', activityValue: item.activityValue })),
+      ...(todayActivity?.products || []).filter(item => item.activityValue > 0).map(item => ({ sourceType: 'product' as const, name: data.products.find(source => source.id === item.sourceId)?.name ?? '已删除系统', activityValue: item.activityValue })),
+    ].sort((a, b) => b.activityValue - a.activityValue) : [];
+    return { id: entity.id, type: 'entity', position: data.settings.positions[entity.id] ?? { x: 0, y: 0 }, data: { entityType: type, name: entity.name, icon: entityIconName(data, type, entity), subtitle, count: data.relations.filter(r => r.sourceId === entity.id || r.targetId === entity.id).length, totalFeedbacks: feedbackSummary.total, unansweredFeedbacks: feedbackSummary.unanswered, activityLevel, activityUpdatedAt, todayActivity, activityHeatItems, selected: entity.id === selectedId, dimmed: !!selectedId && !related.has(entity.id) } };
   });
   const edges: Edge[] = relations.map(rel => ({ id: rel.id, source: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.targetId : rel.sourceId, target: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.sourceId : rel.targetId, label: rel.relationType === 'installed_in' ? '安装设备' : rel.relationType === 'holds_position' ? '任职人员' : (rel.label ?? relationLabels[rel.relationType]), animated: selectedId === rel.sourceId || selectedId === rel.targetId, style: { stroke: relationColors[rel.relationType], strokeWidth: selectedId === rel.sourceId || selectedId === rel.targetId ? 2.6 : 1.2, opacity: selectedId && rel.sourceId !== selectedId && rel.targetId !== selectedId ? .12 : .72, strokeDasharray: ['binds_to', 'manages', 'covers'].includes(rel.relationType) ? '6 4' : undefined }, labelStyle: { fill: '#9fb3c8', fontSize: 10 }, labelBgStyle: { fill: '#07192c', fillOpacity: .86 }, markerEnd: { type: MarkerType.ArrowClosed, color: relationColors[rel.relationType] } }));
   return { nodes, edges };
@@ -186,7 +216,7 @@ function AppContent() {
     if (!projects.length) return null;
     const value: unknown = await apiRequest(`/projects/${projects[0].id}/graph`, { cache: 'no-store' });
     if (!isProjectData(value)) throw new Error('项目数据文件结构无效');
-    if (value.dataRevision !== 17) throw new Error('项目数据版本不匹配');
+    if (value.dataRevision !== 18) throw new Error('项目数据版本不匹配');
     return normalizeProjectData(value);
   }, []);
 
@@ -420,7 +450,7 @@ function AppContent() {
       <div className="entity-list">{managerList.map(entity => <Card key={entity.id} size="small"><div className="entity-list-row"><div className="list-icon" style={{ color: typeColors[managerTab] }}>{iconMap[entityIconName(data, managerTab, entity)] ?? <AppstoreOutlined />}</div><div className="list-content"><strong>{entity.name}</strong><Text>{entity.id}</Text></div>{editMode && <Space><Button type="text" icon={<EditOutlined />} onClick={() => openEditor(managerTab, entity)} /><Popconfirm title="确定删除？" onConfirm={() => deleteEntity(managerTab, entity.id)}><Button danger type="text" icon={<DeleteOutlined />} /></Popconfirm></Space>}</div></Card>)}</div>
     </Drawer>
 
-    <Modal title={<div className="entity-modal-title">{editor && editor.type !== 'device' && <IconPicker value={editorIcon} onChange={value => form.setFieldValue('icon', value)} />}<span>{`${editor?.item ? '编辑' : '新增'}${editor ? entityLabels[editor.type] : ''}`}</span></div>} open={!!editor} onCancel={() => setEditor(null)} onOk={() => void saveEntity()} afterOpenChange={open => { if (open) populateEntityForm(); }} okText="保存" cancelText="取消" destroyOnHidden>
+    <Modal width={520} styles={{ body: { maxHeight: 'calc(100vh - 210px)', overflowY: 'auto', paddingRight: 6 } }} title={<div className="entity-modal-title">{editor && editor.type !== 'device' && <IconPicker value={editorIcon} onChange={value => form.setFieldValue('icon', value)} />}<span>{`${editor?.item ? '编辑' : '新增'}${editor ? entityLabels[editor.type] : ''}`}</span></div>} open={!!editor} onCancel={() => setEditor(null)} onOk={() => void saveEntity()} afterOpenChange={open => { if (open) populateEntityForm(); }} okText="保存" cancelText="取消" destroyOnHidden>
       {editor && <EntityForm form={form} type={editor.type} data={data} />}
     </Modal>
     <Modal title={relationEditor?.id ? '编辑关系' : '新增关系'} open={!!relationEditor} onCancel={() => setRelationEditor(null)} onOk={() => void saveRelation()} afterOpenChange={open => { if (open && relationEditor) { relationForm.resetFields(); relationForm.setFieldsValue(relationEditor); } }} okText="保存关系" cancelText="取消" destroyOnHidden>
@@ -606,6 +636,68 @@ function EntityFeedbackSection({ projectId, entityId, onChanged }: { projectId: 
   </section>;
 }
 
+function PersonActivityDetails({ data, personId, onSaved }: { data: ProjectRelationshipData; personId: string; onSaved: () => Promise<void> }) {
+  const { message } = AntApp.useApp();
+  const today = projectToday();
+  const [from, setFrom] = useState(today);
+  const [to, setTo] = useState(today);
+  const [rangeMode, setRangeMode] = useState(false);
+  const [value, setValue] = useState<PersonActivityRange>({ from: today, to: today, items: [] });
+  const [draft, setDraft] = useState<Record<string, number | ''>>({});
+  const [touched, setTouched] = useState(new Set<string>());
+  const [showAll, setShowAll] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const sources = useMemo(() => [
+    ...data.deviceTypes.map(item => ({ sourceType: 'deviceType' as const, sourceId: item.id, name: item.name, icon: iconMap[item.icon] ?? <ToolOutlined /> })),
+    ...data.products.map(item => ({ sourceType: 'product' as const, sourceId: item.id, name: item.name, icon: iconMap[item.icon] ?? <AppstoreOutlined /> })),
+  ], [data.deviceTypes, data.products]);
+  const refreshToken = JSON.stringify(data.persons.find(person => person.id === personId)?.todayActivity || {});
+  const load = useCallback(async () => {
+    if (!from || !to || from > to) return;
+    setLoading(true);
+    try {
+      const result = await apiRequest<PersonActivityRange>(`/projects/${data.project.id}/persons/${personId}/activities?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { cache: 'no-store' });
+      const dayCount = Math.floor((new Date(`${to}T00:00:00Z`).getTime() - new Date(`${from}T00:00:00Z`).getTime()) / 86400000) + 1;
+      const nextDraft: Record<string, number | ''> = {};
+      for (const source of sources) {
+        const rows = result.items.filter(item => item.sourceType === source.sourceType && item.sourceId === source.sourceId);
+        const values = new Set(rows.map(item => item.activityValue));
+        if (rows.length < dayCount) values.add(0);
+        nextDraft[`${source.sourceType}:${source.sourceId}`] = values.size === 1 ? [...values][0] : '';
+      }
+      setValue(result); setDraft(nextDraft); setTouched(new Set());
+    } catch (error) { message.error(error instanceof Error ? error.message : '人员活跃度载入失败'); }
+    finally { setLoading(false); }
+  }, [data.project.id, from, message, personId, sources, to]);
+  useEffect(() => { void load(); }, [load, refreshToken]);
+  const save = async () => {
+    if (!touched.size) return;
+    const entries = sources.filter(source => touched.has(`${source.sourceType}:${source.sourceId}`)).map(source => ({ sourceType: source.sourceType, sourceId: source.sourceId, activityValue: Number(draft[`${source.sourceType}:${source.sourceId}`] || 0) }));
+    setSaving(true);
+    try {
+      await apiRequest(`/projects/${data.project.id}/persons/${personId}/activities`, { method: 'PATCH', body: JSON.stringify({ from, to, entries }) });
+      await load(); await onSaved(); message.success(rangeMode ? '日期范围内的每日活跃度已保存' : '当日活跃度已保存');
+    } catch (error) { message.error(error instanceof Error ? error.message : '人员活跃度保存失败'); }
+    finally { setSaving(false); }
+  };
+  const total = value.items.reduce((sum, item) => sum + item.activityValue, 0);
+  const visibleSources = sources.filter(source => {
+    const key = `${source.sourceType}:${source.sourceId}`;
+    return showAll || touched.has(key) || Number(draft[key] || 0) > 0;
+  });
+  const renderSources = (sourceType: PersonActivitySourceType, title: string) => {
+    const rows = visibleSources.filter(source => source.sourceType === sourceType);
+    if (!rows.length) return null;
+    return <div className="person-activity-direct-section"><div className="person-activity-direct-title"><strong>{title}</strong><span>{rows.length} 项</span></div>{rows.map(source => {
+    const key = `${source.sourceType}:${source.sourceId}`;
+    const mixed = draft[key] === '' && value.items.some(item => item.sourceType === source.sourceType && item.sourceId === source.sourceId);
+    return <label key={key} className={touched.has(key) ? 'changed' : ''}><span className={source.sourceType}>{source.icon}</span><strong title={source.name}>{source.name}</strong><Input type="number" min={0} step={1} value={draft[key]} placeholder={mixed ? '多值' : '0'} aria-label={`${source.name}活跃值`} onChange={event => { const raw = event.target.value; if (raw && (!/^\d+$/.test(raw) || Number(raw) > Number.MAX_SAFE_INTEGER)) return; setDraft(current => ({ ...current, [key]: raw === '' ? '' : Number(raw) })); setTouched(current => new Set(current).add(key)); }} /></label>;
+  })}</div>;
+  };
+  return <section className="person-activity-detail"><div className="person-activity-detail-head"><span><small>人员活跃度</small><strong>{!rangeMode && from === today ? '今日' : rangeMode ? '批量调整' : from}</strong></span><div className="person-activity-detail-actions"><Button type="text" size="small" onClick={() => setShowAll(current => !current)}>{showAll ? '完成' : '编辑'}</Button><Button type="text" size="small" onClick={() => { setRangeMode(current => { if (current) setTo(from); return !current; }); }}>{rangeMode ? '单日' : '批量'}</Button></div></div><div className={`person-activity-detail-dates ${rangeMode ? 'range' : ''}`}><Input type="date" value={from} max={to} onChange={event => { const next = event.target.value; setFrom(next); if (!rangeMode || next > to) setTo(next); }} />{rangeMode && <><span>至</span><Input type="date" value={to} min={from} onChange={event => setTo(event.target.value)} /></>}</div>{rangeMode && <Text className="person-activity-range-tip">输入值将覆盖范围内每一天</Text>}<div className="person-activity-total"><ThunderboltOutlined /><strong>{total}</strong><span>{rangeMode ? '区间合计' : '活跃值'}</span></div>{loading ? <div className="person-activity-loading"><Spin size="small" />正在读取</div> : visibleSources.length ? <>{renderSources('deviceType', '设备类型')}{renderSources('product', '系统')}</> : <div className="person-activity-empty">暂无非零活跃值，点击编辑后设置</div>}{touched.size > 0 && <div className="person-activity-direct-save"><Text>清零按 0 处理</Text><Button size="small" type="primary" loading={saving} onClick={() => void save()}>保存调整</Button></div>}</section>;
+}
+
 function EntityDetails({ data, type, entity, detailLoading, onLocate, onEdit, editMode, onAddRelation, onDeleteRelation, onReorderRelations, onActivityChanged, onFeedbackChanged }: { data: ProjectRelationshipData; type: EntityType; entity: Entity; detailLoading: boolean; onLocate: (id: string) => void; onEdit: () => void; editMode: boolean; onAddRelation: () => void; onDeleteRelation: (relationId: string) => void; onReorderRelations: (draggedId: string, targetId: string) => void; onActivityChanged: (entityId: string, level: number, updatedAt?: string) => void; onFeedbackChanged: () => Promise<void> }) {
   const { message } = AntApp.useApp();
   const relations = data.relations.filter(rel => rel.sourceId === entity.id || rel.targetId === entity.id);
@@ -652,7 +744,8 @@ function EntityDetails({ data, type, entity, detailLoading, onLocate, onEdit, ed
     activitySaveTimers.current.set(targetEntityId, timer);
   };
   return <div className="detail-content"><Button className="entity-detail-edit" icon={<EditOutlined />} onClick={onEdit}>编辑</Button><div className="detail-icon" style={{ color: typeColors[type] }}>{iconMap[entityIconName(data, type, entity)] ?? <AppstoreOutlined />}</div><Tag color={typeColors[type]}>{entityLabels[type]}</Tag><Title level={4}>{entity.name}</Title>{detailLoading && <Text type="secondary">正在载入完整详情…</Text>}{'description' in entity && entity.description && <Text>{entity.description}</Text>}
-    {isActivityEntity(type) && <div className="activity-detail-card" style={{ '--activity-color': activityColor(activityDraft) } as React.CSSProperties}><div className="activity-detail-head"><span><small>使用状态评估</small><strong>{activityLabel(activityDraft)}</strong></span><ActivitySignal level={activityDraft} /></div><ActivitySegments level={activityDraft} /><Slider className="activity-quick-slider" min={0} max={100} step={10} value={activityDraft} tooltip={{ formatter: value => `${value}%` }} onChange={previewActivity} onChangeComplete={scheduleActivitySave} /></div>}
+    {isActivityEntity(type) && <div className="activity-detail-card" style={{ '--activity-color': activityColor(activityDraft) } as React.CSSProperties}><div className="activity-detail-head"><span><small>使用状态评估</small><strong>{activityLabel(activityDraft)}</strong></span><ActivitySignal level={activityDraft} /></div><div className="activity-choice-row"><button type="button" className={`activity-zero ${activityDraft === 0 ? 'selected' : ''}`} aria-label="将使用状态评估清零" aria-pressed={activityDraft === 0} onClick={() => { previewActivity(0); scheduleActivitySave(0); }}>0</button><ActivitySegments level={activityDraft} onSelect={level => { previewActivity(level); scheduleActivitySave(level); }} /></div><div className="activity-choice-hint">点击灯格选择档位，调整后自动保存</div></div>}
+    {type === 'person' && <PersonActivityDetails data={data} personId={entity.id} onSaved={onFeedbackChanged} />}
     {'phone' in entity && entity.phone && <div className="detail-field"><span>联系电话</span><strong>{entity.phone}</strong></div>}
     {'address' in entity && entity.address && <div className="detail-field"><span>项目地址</span><strong>{entity.address}</strong></div>}
     {'areaId' in entity && <div className="detail-field"><span>安装区域</span><strong>{data.areas.find(area => area.id === entity.areaId)?.name ?? '未分配'}</strong></div>}

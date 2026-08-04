@@ -1,6 +1,6 @@
 import { Type } from 'class-transformer';
 import { IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
-import { activityLevels, feedbackStatuses, deviceCategories, entityTypes, relationTypes, type EntityType, type FeedbackStatus, type RelationType } from '../database/schemas.js';
+import { activityLevels, feedbackStatuses, deviceCategories, entityTypes, personActivitySourceTypes, relationTypes, type EntityType, type FeedbackStatus, type PersonActivitySourceType, type RelationType } from '../database/schemas.js';
 
 export class CreateProjectDto {
   @IsOptional() @IsString() id?: string;
@@ -81,4 +81,17 @@ export class CreateFeedbackDto {
 export class UpdateFeedbackDto extends CreateFeedbackDto {
   @Type(() => Number) @IsInt() @Min(1) revision: number;
   @IsOptional() @IsString() removeAttachmentIds?: string;
+}
+
+export class PersonActivityEntryDto {
+  @IsIn(personActivitySourceTypes) sourceType: PersonActivitySourceType;
+  @IsString() sourceId: string;
+  @Type(() => Number) @IsInt() @Min(0) @Max(Number.MAX_SAFE_INTEGER) activityValue: number;
+}
+
+export class SetPersonActivitiesDto {
+  @IsString() from: string;
+  @IsString() to: string;
+  @IsArray() @ValidateNested({ each: true }) @Type(() => PersonActivityEntryDto)
+  entries: PersonActivityEntryDto[];
 }

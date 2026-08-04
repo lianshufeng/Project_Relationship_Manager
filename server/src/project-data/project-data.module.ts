@@ -5,8 +5,9 @@ import {
   GraphSettingsRecord, GraphSettingsSchema, MigrationRunRecord, MigrationRunSchema,
   RelationRecord, RelationSchema, EntityFeedbackRecord, EntityFeedbackSchema,
   FeedbackAttachmentRecord, FeedbackAttachmentSchema,
+  PersonActivityRecord, PersonActivitySchema,
 } from '../database/schemas.js';
-import { EntitiesController, FeedbackController, LayoutsController, ProjectsController, RelationsController } from './project-data.controller.js';
+import { EntitiesController, FeedbackController, LayoutsController, PersonActivitiesController, ProjectsController, RelationsController } from './project-data.controller.js';
 import { FeedbackService } from './feedback.service.js';
 import { ProjectDataService } from './project-data.service.js';
 
@@ -18,9 +19,10 @@ import { ProjectDataService } from './project-data.service.js';
     { name: GraphSettingsRecord.name, schema: GraphSettingsSchema },
     { name: EntityFeedbackRecord.name, schema: EntityFeedbackSchema },
     { name: FeedbackAttachmentRecord.name, schema: FeedbackAttachmentSchema },
+    { name: PersonActivityRecord.name, schema: PersonActivitySchema },
     { name: MigrationRunRecord.name, schema: MigrationRunSchema },
   ])],
-  controllers: [ProjectsController, EntitiesController, RelationsController, LayoutsController, FeedbackController],
+  controllers: [ProjectsController, EntitiesController, RelationsController, LayoutsController, FeedbackController, PersonActivitiesController],
   providers: [ProjectDataService, FeedbackService],
   exports: [ProjectDataService],
 })

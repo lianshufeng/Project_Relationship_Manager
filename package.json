@@ -16,7 +16,8 @@
     "mongo:check": "npm run build:scripts && node dist/scripts/scripts/check-mongo.js",
     "mongo:migrate": "npm run build:scripts && node dist/scripts/scripts/import-json.js",
     "mongo:migrate:activity": "npm run build:scripts && node dist/scripts/scripts/migrate-activity-level.js",
-    "mongo:migrate:activity-step": "npm run build:scripts && node dist/scripts/scripts/migrate-activity-level-step.js"
+    "mongo:migrate:activity-step": "npm run build:scripts && node dist/scripts/scripts/migrate-activity-level-step.js",
+    "mongo:migrate:person-activity": "npm run build:scripts && node dist/scripts/scripts/migrate-person-activity.js"
   },
   "dependencies": {
     "@ant-design/icons": "^6.1.0",

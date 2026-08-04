@@ -5,16 +5,17 @@ import type { ClientSession, Connection, Model } from 'mongoose';
 import type { ObjectId } from 'mongodb';
 import {
   EntityFeedbackRecord, EntityRecord, FeedbackAttachmentRecord, GraphLayoutRecord, GraphSettingsRecord, RelationRecord,
-  type EntityType, type RelationType,
+  PersonActivityRecord, type EntityType, type PersonActivitySourceType, type RelationType,
 } from '../database/schemas.js';
 import { deleteFeedbackImages, readFeedbackImage, uploadFeedbackImage } from '../database/feedback-gridfs.js';
 import type {
   CreateProjectDto, EntityMutationDto, LayoutPositionDto, RelationMutationDto,
-  UpdateGraphSettingsDto,
+  SetPersonActivitiesDto, UpdateGraphSettingsDto,
 } from './dto.js';
 
 type PlainEntity = EntityRecord & { createdAt?: Date; updatedAt?: Date };
 type PlainRelation = RelationRecord & { createdAt?: Date; updatedAt?: Date };
+type PlainPersonActivity = PersonActivityRecord & { createdAt?: Date; updatedAt?: Date };
 type ImportedAttachment = { _id: string; projectId: string; entityId: string; feedbackId: string; fileName: string; mimeType: string; size: number; data: Buffer };
 type StoredImportedAttachment = Omit<ImportedAttachment, 'data'> & { gridFsFileId: ObjectId };
 
@@ -33,6 +34,7 @@ export class ProjectDataService {
     @InjectModel(GraphSettingsRecord.name) private readonly settings: Model<GraphSettingsRecord>,
     @InjectModel(EntityFeedbackRecord.name) private readonly feedbacks: Model<EntityFeedbackRecord>,
     @InjectModel(FeedbackAttachmentRecord.name) private readonly feedbackAttachments: Model<FeedbackAttachmentRecord>,
+    @InjectModel(PersonActivityRecord.name) private readonly personActivities: Model<PersonActivityRecord>,
     @InjectConnection() private readonly connection: Connection,
   ) {}
 
@@ -61,11 +63,12 @@ export class ProjectDataService {
 
   async deleteProject(projectId: string) {
     await this.ensureProject(projectId);
-    const deleted = { entityCount: 0, relationCount: 0, layoutCount: 0, settingsCount: 0, feedbackCount: 0, feedbackAttachmentCount: 0 };
+    const deleted = { entityCount: 0, relationCount: 0, layoutCount: 0, settingsCount: 0, feedbackCount: 0, feedbackAttachmentCount: 0, personActivityCount: 0 };
     const fileIds = (await this.feedbackAttachments.find({ projectId }).select({ gridFsFileId: 1 }).lean().exec()).map(item => item.gridFsFileId);
     await this.connection.transaction(async session => {
       deleted.feedbackAttachmentCount = (await this.feedbackAttachments.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.feedbackCount = (await this.feedbacks.deleteMany({ projectId }).session(session)).deletedCount;
+      deleted.personActivityCount = (await this.personActivities.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.relationCount = (await this.relations.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.layoutCount = (await this.layouts.deleteMany({ projectId }).session(session)).deletedCount;
       deleted.settingsCount = (await this.settings.deleteMany({ projectId }).session(session)).deletedCount;
@@ -83,7 +86,8 @@ export class ProjectDataService {
         parentId: 1, teamType: 1, teamId: 1, category: 1, deviceTypeId: 1, activityLevel: 1, activityUpdatedAt: 1,
       });
     }
-    const [entityRows, relationRows, layoutRows, graphSettings, feedbackSummaryRows] = await Promise.all([
+    const today = this.projectDate();
+    const [entityRows, relationRows, layoutRows, graphSettings, feedbackSummaryRows, personActivityRows] = await Promise.all([
       entityQuery.lean().exec(),
       this.relations.find({ projectId }).select({ _id: 1, sourceEntityId: 1, targetEntityId: 1, relationType: 1, label: 1 }).sort({ sort: 1, _id: 1 }).lean().exec(),
       this.layouts.find({ projectId }).select({ entityId: 1, x: 1, y: 1 }).lean().exec(),
@@ -96,6 +100,7 @@ export class ProjectDataService {
           unanswered: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
         } },
       ]).exec(),
+      this.personActivities.find({ projectId, activityDate: today }).select({ personId: 1, sourceType: 1, sourceId: 1, activityValue: 1 }).sort({ personId: 1, sourceType: 1, sourceId: 1 }).lean().exec(),
     ]);
     const entities = entityRows as PlainEntity[];
     const relations = relationRows as PlainRelation[];
@@ -105,6 +110,13 @@ export class ProjectDataService {
     const index = new Map(entities.map(entity => [entity._id, entity]));
     const holdsByPerson = new Map<string, string[]>();
     const areaByDevice = new Map<string, string>();
+    const todayActivityByPerson = new Map<string, { date: string; total: number; deviceTypes: Array<{ sourceId: string; activityValue: number }>; products: Array<{ sourceId: string; activityValue: number }> }>();
+    for (const row of personActivityRows) {
+      const summary = todayActivityByPerson.get(row.personId) || { date: today, total: 0, deviceTypes: [], products: [] };
+      summary.total += row.activityValue;
+      (row.sourceType === 'deviceType' ? summary.deviceTypes : summary.products).push({ sourceId: row.sourceId, activityValue: row.activityValue });
+      todayActivityByPerson.set(row.personId, summary);
+    }
     for (const relation of relations) {
       if (relation.relationType === 'holds_position') {
         holdsByPerson.set(relation.sourceEntityId, [...(holdsByPerson.get(relation.sourceEntityId) || []), relation.targetEntityId]);
@@ -115,7 +127,7 @@ export class ProjectDataService {
     const byType = <T>(type: EntityType, map: (entity: PlainEntity) => T) => entities.filter(entity => entity.entityType === type).map(map);
     return {
       schemaVersion: '1.0',
-      dataRevision: 17,
+      dataRevision: 18,
       project: {
         id: project._id, name: project.name, icon: project.icon || 'BankOutlined',
         ...(includeEntityDetails ? { shortName: project.shortName, address: project.address, description: project.description } : {}),
@@ -132,6 +144,7 @@ export class ProjectDataService {
       })),
       persons: byType('person', entity => ({
         id: entity._id, name: entity.name, icon: entity.icon || 'UserOutlined', positionIds: holdsByPerson.get(entity._id) || [],
+        todayActivity: todayActivityByPerson.get(entity._id) || { date: today, total: 0, deviceTypes: [], products: [] },
         ...(includeEntityDetails ? { phone: entity.phone, avatar: entity.avatar, description: entity.description } : {}),
       })),
       products: byType('product', entity => ({
@@ -173,10 +186,11 @@ export class ProjectDataService {
   }
 
   async exportProject(projectId: string) {
-    const [graph, feedbackRows, attachmentRows] = await Promise.all([
+    const [graph, feedbackRows, attachmentRows, personActivityRows] = await Promise.all([
       this.getGraph(projectId, true),
       this.feedbacks.find({ projectId }).sort({ createdAt: 1, _id: 1 }).lean().exec(),
       this.feedbackAttachments.find({ projectId }).sort({ createdAt: 1, _id: 1 }).lean().exec(),
+      this.personActivities.find({ projectId }).sort({ activityDate: 1, personId: 1, sourceType: 1, sourceId: 1 }).lean().exec(),
     ]);
     const exportedAttachments = await Promise.all(attachmentRows.map(async attachment => ({
       id: attachment._id,
@@ -192,6 +206,18 @@ export class ProjectDataService {
     }
     return {
       ...graph,
+      personActivities: personActivityRows.map(record => ({
+        id: record._id,
+        personId: record.personId,
+        activityDate: record.activityDate,
+        sourceType: record.sourceType,
+        sourceId: record.sourceId,
+        sourceNameSnapshot: record.sourceNameSnapshot,
+        activityValue: record.activityValue,
+        revision: record.revision,
+        createdAt: (record as typeof record & { createdAt?: Date }).createdAt,
+        updatedAt: (record as typeof record & { updatedAt?: Date }).updatedAt,
+      })),
       feedbacks: feedbackRows.map(record => ({
         id: record._id,
         entityId: record.entityId,
@@ -217,7 +243,7 @@ export class ProjectDataService {
   async importGraph(projectId: string, value: Record<string, unknown>) {
     const project = value.project as Record<string, unknown> | undefined;
     const collections = ['teams', 'positions', 'persons', 'products', 'deviceTypes', 'devices', 'areas', 'relations'] as const;
-    if (value.schemaVersion !== '1.0' || (value.dataRevision !== 16 && value.dataRevision !== 17) || !project || project.id !== projectId || typeof project.name !== 'string' || !project.name.trim() || collections.some(key => !Array.isArray(value[key]))) {
+    if (value.schemaVersion !== '1.0' || ![16, 17, 18].includes(Number(value.dataRevision)) || !project || project.id !== projectId || typeof project.name !== 'string' || !project.name.trim() || collections.some(key => !Array.isArray(value[key])) || (value.dataRevision === 18 && !Array.isArray(value.personActivities))) {
       throw new BadRequestException('导入配置结构无效或项目 ID 不匹配');
     }
     const rows = <T extends Record<string, unknown>>(key: typeof collections[number]) => value[key] as T[];
@@ -250,12 +276,14 @@ export class ProjectDataService {
       throw new BadRequestException('导入配置包含孤立关系');
     }
     const imported = this.parseImportedFeedbacks(projectId, value.feedbacks, ids);
+    const importedPersonActivities = this.parseImportedPersonActivities(projectId, value.personActivities, entities, value.dataRevision === 18);
     const oldFileIds = (await this.feedbackAttachments.find({ projectId }).select({ gridFsFileId: 1 }).lean().exec()).map(item => item.gridFsFileId);
     const storedAttachments = await this.storeImportedAttachments(imported.attachments);
     try {
       await this.connection.transaction(async session => {
         await this.feedbackAttachments.deleteMany({ projectId }).session(session);
         await this.feedbacks.deleteMany({ projectId }).session(session);
+        await this.personActivities.deleteMany({ projectId }).session(session);
         await this.relations.deleteMany({ projectId }).session(session);
         await this.layouts.deleteMany({ projectId }).session(session);
         await this.settings.deleteMany({ projectId }).session(session);
@@ -263,6 +291,7 @@ export class ProjectDataService {
         await this.entities.insertMany(entities, { session });
         await this.relations.insertMany(relations, { session });
         if (imported.feedbacks.length) await this.feedbacks.insertMany(imported.feedbacks, { session });
+        if (importedPersonActivities.length) await this.personActivities.insertMany(importedPersonActivities, { session });
         if (storedAttachments.length) await this.feedbackAttachments.insertMany(storedAttachments, { session });
         if (layouts.length) await this.layouts.insertMany(layouts, { session });
         await this.settings.create([{
@@ -275,7 +304,43 @@ export class ProjectDataService {
       throw error;
     }
     await this.cleanupGridFs(oldFileIds);
-    return { message: '项目配置已导入', entityCount: entities.length, relationCount: relations.length, layoutCount: layouts.length, feedbackCount: imported.feedbacks.length, feedbackAttachmentCount: imported.attachments.length };
+    return { message: '项目配置已导入', entityCount: entities.length, relationCount: relations.length, layoutCount: layouts.length, feedbackCount: imported.feedbacks.length, feedbackAttachmentCount: imported.attachments.length, personActivityCount: importedPersonActivities.length };
+  }
+
+  async listPersonActivities(projectId: string, personId: string, from?: string, to?: string) {
+    await this.ensurePerson(projectId, personId);
+    const range = this.activityDateRange(from || this.projectDate(), to || from || this.projectDate());
+    const rows = await this.personActivities.find({ projectId, personId, activityDate: { $gte: range[0], $lte: range.at(-1)! } }).sort({ activityDate: 1, sourceType: 1, sourceId: 1 }).lean().exec();
+    return {
+      from: range[0], to: range.at(-1),
+      items: (rows as PlainPersonActivity[]).map(row => ({
+        id: row._id, activityDate: row.activityDate, sourceType: row.sourceType, sourceId: row.sourceId,
+        sourceNameSnapshot: row.sourceNameSnapshot, activityValue: row.activityValue, revision: row.revision,
+        createdAt: row.createdAt, updatedAt: row.updatedAt,
+      })),
+    };
+  }
+
+  async setPersonActivities(projectId: string, personId: string, dto: SetPersonActivitiesDto) {
+    await this.ensurePerson(projectId, personId);
+    const dates = this.activityDateRange(dto.from, dto.to);
+    const keys = dto.entries.map(entry => `${entry.sourceType}:${entry.sourceId}`);
+    if (new Set(keys).size !== keys.length) throw new BadRequestException('活跃度来源不能重复');
+    const sourceIds = dto.entries.map(entry => entry.sourceId);
+    const sources = await this.entities.find({ projectId, _id: { $in: sourceIds }, entityType: { $in: ['deviceType', 'product'] } }).select({ _id: 1, entityType: 1, name: 1 }).lean().exec();
+    const sourceIndex = new Map(sources.map(source => [source._id, source]));
+    if (dto.entries.some(entry => sourceIndex.get(entry.sourceId)?.entityType !== entry.sourceType)) throw new BadRequestException('活跃度包含无效的设备类型或系统来源');
+    const operations = dates.flatMap(activityDate => dto.entries.map(entry => {
+      const filter = { projectId, personId, activityDate, sourceType: entry.sourceType, sourceId: entry.sourceId };
+      if (entry.activityValue === 0) return { deleteOne: { filter } } as const;
+      return { updateOne: { filter, update: {
+        $set: { activityValue: entry.activityValue, sourceNameSnapshot: sourceIndex.get(entry.sourceId)!.name },
+        $setOnInsert: { _id: `person-activity-${randomUUID()}`, projectId, personId, activityDate, sourceType: entry.sourceType, sourceId: entry.sourceId },
+        $inc: { revision: 1 },
+      }, upsert: true } } as const;
+    }));
+    if (operations.length) await this.connection.transaction(async session => { await this.personActivities.bulkWrite(operations, { session }); });
+    return this.listPersonActivities(projectId, personId, dto.from, dto.to);
   }
 
   async listEntities(projectId: string, entityType?: EntityType) {
@@ -350,6 +415,7 @@ export class ProjectDataService {
         await this.feedbackAttachments.deleteMany({ projectId, entityId, feedbackId: { $in: feedbackIds } }).session(session);
       }
       await this.feedbacks.deleteMany({ projectId, entityId }).session(session);
+      if (entity.entityType === 'person') await this.personActivities.deleteMany({ projectId, personId: entityId }).session(session);
       await this.relations.deleteMany({ projectId, $or: [{ sourceEntityId: entityId }, { targetEntityId: entityId }] }).session(session);
       await this.layouts.deleteOne({ projectId, entityId }).session(session);
     });
@@ -620,6 +686,59 @@ export class ProjectDataService {
   private async ensureEntity(projectId: string, entityId: string) {
     const entity = await this.entities.exists({ _id: entityId, projectId });
     if (!entity) throw new NotFoundException('实体不存在');
+  }
+
+  private async ensurePerson(projectId: string, personId: string) {
+    const person = await this.entities.exists({ _id: personId, projectId, entityType: 'person' });
+    if (!person) throw new NotFoundException('人员不存在');
+  }
+
+  private projectDate(date = new Date()) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(date);
+  }
+
+  private activityDateRange(from: string, to: string) {
+    const pattern = /^\d{4}-\d{2}-\d{2}$/;
+    if (!pattern.test(from) || !pattern.test(to)) throw new BadRequestException('活跃度日期格式必须为 YYYY-MM-DD');
+    const start = new Date(`${from}T00:00:00Z`);
+    const end = new Date(`${to}T00:00:00Z`);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || this.projectDate(start).replaceAll('/', '-') !== from || this.projectDate(end).replaceAll('/', '-') !== to || start > end) {
+      throw new BadRequestException('活跃度日期范围无效');
+    }
+    const dayCount = Math.floor((end.getTime() - start.getTime()) / 86400000) + 1;
+    if (dayCount > 366) throw new BadRequestException('单次活跃度日期范围不能超过 366 天');
+    return Array.from({ length: dayCount }, (_, index) => new Date(start.getTime() + index * 86400000).toISOString().slice(0, 10));
+  }
+
+  private parseImportedPersonActivities(projectId: string, value: unknown, entities: Array<Record<string, unknown> & { _id: string }>, required: boolean) {
+    if (value === undefined && !required) return [];
+    if (!Array.isArray(value)) throw new BadRequestException('导入配置中的人员活跃度结构无效');
+    const entityIndex = new Map(entities.map(entity => [entity._id, entity]));
+    const uniqueKeys = new Set<string>();
+    return value.map(raw => {
+      if (!raw || typeof raw !== 'object') throw new BadRequestException('导入配置包含无效人员活跃度记录');
+      const item = raw as Record<string, unknown>;
+      const id = typeof item.id === 'string' && item.id ? item.id : `person-activity-${randomUUID()}`;
+      const personId = typeof item.personId === 'string' ? item.personId : '';
+      const activityDate = typeof item.activityDate === 'string' ? item.activityDate : '';
+      const sourceType = item.sourceType as PersonActivitySourceType;
+      const sourceId = typeof item.sourceId === 'string' ? item.sourceId : '';
+      const person = entityIndex.get(personId);
+      const source = entityIndex.get(sourceId);
+      const sourceNameSnapshot = typeof item.sourceNameSnapshot === 'string' && item.sourceNameSnapshot.trim() ? item.sourceNameSnapshot.trim() : typeof source?.name === 'string' ? source.name : '';
+      const key = `${personId}:${activityDate}:${sourceType}:${sourceId}`;
+      this.activityDateRange(activityDate, activityDate);
+      if (person?.entityType !== 'person' || !['deviceType', 'product'].includes(sourceType) || !sourceId || (source && source.entityType !== sourceType) || !sourceNameSnapshot || !Number.isSafeInteger(item.activityValue) || Number(item.activityValue) <= 0 || uniqueKeys.has(key)) {
+        throw new BadRequestException('导入配置包含无效或重复的人员活跃度记录');
+      }
+      uniqueKeys.add(key);
+      return {
+        _id: id, projectId, personId, activityDate, sourceType, sourceId, sourceNameSnapshot,
+        activityValue: Number(item.activityValue), revision: Number.isInteger(item.revision) && Number(item.revision) >= 1 ? Number(item.revision) : 1,
+        ...(this.parseImportDate(item.createdAt) ? { createdAt: this.parseImportDate(item.createdAt) } : {}),
+        ...(this.parseImportDate(item.updatedAt) ? { updatedAt: this.parseImportDate(item.updatedAt) } : {}),
+      };
+    });
   }
 
   private parseImportedFeedbacks(projectId: string, value: unknown, entityIds: Set<string>): { feedbacks: Array<Record<string, unknown> & { _id: string; entityId: string; kind: string; rootFeedbackId?: string }>; attachments: ImportedAttachment[] } {

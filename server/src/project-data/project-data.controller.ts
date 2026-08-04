@@ -5,7 +5,7 @@ import type { Response } from 'express';
 import type { EntityType } from '../database/schemas.js';
 import {
   CreateFeedbackDto, CreateProjectDto, EntityMutationDto, RelationMutationDto, ReorderRelationsDto, UpdateFeedbackDto,
-  UpdateGraphSettingsDto, UpdateLayoutDto, UpdateLayoutsDto,
+  SetPersonActivitiesDto, UpdateGraphSettingsDto, UpdateLayoutDto, UpdateLayoutsDto,
 } from './dto.js';
 import { ProjectDataService } from './project-data.service.js';
 import { FeedbackService, type FeedbackImage } from './feedback.service.js';
@@ -58,6 +58,22 @@ export class LayoutsController {
 
   @Patch() updateMany(@Param('projectId') projectId: string, @Body() dto: UpdateLayoutsDto) { return this.service.updateLayouts(projectId, dto.positions); }
   @Patch(':entityId') update(@Param('projectId') projectId: string, @Param('entityId') entityId: string, @Body() dto: UpdateLayoutDto) { return this.service.updateLayout(projectId, entityId, dto); }
+}
+
+@ApiTags('人员活跃度')
+@Controller({ path: 'projects/:projectId/persons/:personId/activities', version: '1' })
+export class PersonActivitiesController {
+  constructor(private readonly service: ProjectDataService) {}
+
+  @Get()
+  list(@Param('projectId') projectId: string, @Param('personId') personId: string, @Query('from') from?: string, @Query('to') to?: string) {
+    return this.service.listPersonActivities(projectId, personId, from, to);
+  }
+
+  @Patch()
+  set(@Param('projectId') projectId: string, @Param('personId') personId: string, @Body() dto: SetPersonActivitiesDto) {
+    return this.service.setPersonActivities(projectId, personId, dto);
+  }
 }
 
 const feedbackUpload = FileFieldsInterceptor([{ name: 'images', maxCount: 20 }], {

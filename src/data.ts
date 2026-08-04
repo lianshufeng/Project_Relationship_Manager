@@ -27,11 +27,11 @@ export function normalizeProjectData(data: ProjectRelationshipData): ProjectRela
   const fixedDeviceIds = new Set(data.devices.filter(device => data.deviceTypes.find(type => type.id === device.deviceTypeId)?.category === 'fixed').map(device => device.id));
   return {
     ...data,
-    dataRevision: 17,
+    dataRevision: 18,
     feedbackSummaries: data.feedbackSummaries || {},
     project: withoutStatus(data.project),
     positions: data.positions.map(position => ({ ...position, projectId: data.project.id })),
-    persons: data.persons.map(person => withoutStatus({ ...person, positionIds: person.positionIds.filter(positionId => idsByType.position.has(positionId)) })),
+    persons: data.persons.map(person => withoutStatus({ ...person, positionIds: person.positionIds.filter(positionId => idsByType.position.has(positionId)), todayActivity: person.todayActivity || { date: '', total: 0, deviceTypes: [], products: [] } })),
     products: data.products.map(product => ({ ...withoutProductCategory(withoutStatus(product)), activityLevel: Number.isInteger(product.activityLevel) ? product.activityLevel : 0 })),
     areas: data.areas.map(area => withoutAreaType(withoutRiskLevel(area))),
     devices: data.devices.map(device => {
