@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ApartmentOutlined, AppstoreOutlined, BankOutlined, BuildOutlined, CameraOutlined, CarOutlined, CheckCircleOutlined, CommentOutlined, DeleteOutlined, ExclamationCircleOutlined,
   DownloadOutlined, EditOutlined, EnvironmentOutlined, ExpandOutlined, ExportOutlined, FileTextOutlined,
@@ -123,7 +123,7 @@ function PendingFeedbackImage({ file, onRemove }: { file: File; onRemove: () => 
 
 interface GraphNodeData extends Record<string, unknown> { entityType: EntityType; name: string; icon: string; subtitle: string; count: number; totalFeedbacks: number; unansweredFeedbacks: number; activityLevel: number; activityUpdatedAt?: string; todayActivity?: PersonActivitySummary; activityHeatItems: PersonActivityHeatItem[]; selected: boolean; dimmed: boolean }
 
-function EntityNode({ data }: { data: GraphNodeData }) {
+const EntityNode = memo(function EntityNode({ data }: { data: GraphNodeData }) {
   const color = typeColors[data.entityType];
   return <Tooltip title={<><div>{data.name}</div><div>{data.subtitle} · {data.count} 项关联</div>{data.totalFeedbacks > 0 && <div>{data.totalFeedbacks} 条反馈{data.unansweredFeedbacks > 0 ? ` · ${data.unansweredFeedbacks} 条待跟进` : ''}</div>}</>} placement="top" mouseEnterDelay={.35}><div className={`entity-node ${data.selected ? 'selected' : ''} ${data.dimmed ? 'dimmed' : ''}`} style={{ '--node-color': color } as React.CSSProperties}>
     <Handle type="target" position={FlowPosition.Left} />
@@ -135,7 +135,14 @@ function EntityNode({ data }: { data: GraphNodeData }) {
     </div>
     <Handle type="source" position={FlowPosition.Right} />
   </div></Tooltip>;
-}
+}, (previous, next) => {
+  const a = previous.data; const b = next.data;
+  return a.entityType === b.entityType && a.name === b.name && a.icon === b.icon && a.subtitle === b.subtitle && a.count === b.count
+    && a.totalFeedbacks === b.totalFeedbacks && a.unansweredFeedbacks === b.unansweredFeedbacks && a.activityLevel === b.activityLevel
+    && a.activityUpdatedAt === b.activityUpdatedAt && a.todayActivity === b.todayActivity && a.selected === b.selected && a.dimmed === b.dimmed
+    && a.activityHeatItems.length === b.activityHeatItems.length
+    && a.activityHeatItems.every((item, index) => item.sourceType === b.activityHeatItems[index]?.sourceType && item.name === b.activityHeatItems[index]?.name && item.activityValue === b.activityHeatItems[index]?.activityValue);
+});
 
 const nodeTypes = { entity: EntityNode };
 
@@ -156,24 +163,34 @@ function graphElements(data: ProjectRelationshipData, selectedId: string | null,
   if (filter === 'deviceChain') { const deviceActors = new Set(data.relations.filter(rel => rel.relationType === 'uses' && rel.targetType === 'device').map(rel => rel.sourceId)); relations = relations.filter(rel => (rel.relationType === 'contains' && ((rel.sourceType === 'project' && rel.targetType === 'position') || (rel.sourceType === 'product' && rel.targetType === 'product'))) || ['installed_in', 'covers', 'supports'].includes(rel.relationType) || (rel.relationType === 'uses' && ['device', 'product'].includes(rel.targetType)) || (rel.relationType === 'holds_position' && deviceActors.has(rel.sourceId))); }
   if (filter === 'selected' && selectedId) relations = relations.filter(rel => rel.sourceId === selectedId || rel.targetId === selectedId);
   const related = new Set<string>();
-  if (selectedId) {
-    related.add(selectedId);
-    data.relations.forEach(rel => { if (rel.sourceId === selectedId) related.add(rel.targetId); if (rel.targetId === selectedId) related.add(rel.sourceId); });
-  }
+  const relationCounts = new Map<string, number>();
+  data.relations.forEach(rel => {
+    relationCounts.set(rel.sourceId, (relationCounts.get(rel.sourceId) || 0) + 1);
+    relationCounts.set(rel.targetId, (relationCounts.get(rel.targetId) || 0) + 1);
+    if (selectedId && rel.sourceId === selectedId) related.add(rel.targetId);
+    if (selectedId && rel.targetId === selectedId) related.add(rel.sourceId);
+  });
+  if (selectedId) related.add(selectedId);
+  const positionsById = new Map(data.positions.map(position => [position.id, position]));
+  const deviceTypesById = new Map(data.deviceTypes.map(deviceType => [deviceType.id, deviceType]));
+  const productsById = new Map(data.products.map(product => [product.id, product]));
+  const areasById = new Map(data.areas.map(area => [area.id, area]));
+  const areaDeviceCounts = new Map<string, number>();
+  data.devices.forEach(device => { if (device.areaId) areaDeviceCounts.set(device.areaId, (areaDeviceCounts.get(device.areaId) || 0) + 1); });
   const visibleIds = filter === 'all' || (filter === 'selected' && !selectedId) ? null : new Set(relations.flatMap(rel => [rel.sourceId, rel.targetId]));
   const nodes: Node<GraphNodeData>[] = allEntities(data).filter(({ entity }) => !visibleIds || visibleIds.has(entity.id)).map(({ type, entity }) => {
-    const subtitle = type === 'person' ? (data.positions.find(p => 'positionIds' in entity && entity.positionIds.includes(p.id))?.name ?? '未分配岗位') : type === 'device' ? (() => { const deviceType = data.deviceTypes.find(item => item.id === ('deviceTypeId' in entity ? entity.deviceTypeId : '')); const area = data.areas.find(item => item.id === ('areaId' in entity ? entity.areaId : '')); return `${deviceType?.name ?? '未知设备'} · ${area?.name ?? deviceCategoryLabels[deviceType?.category ?? ''] ?? '未分类'}`; })() : type === 'area' ? `${data.devices.filter(device => device.areaId === entity.id).length} 台设备` : entityLabels[type];
+    const subtitle = type === 'person' ? (('positionIds' in entity && entity.positionIds.length ? positionsById.get(entity.positionIds[0])?.name : undefined) ?? '未分配岗位') : type === 'device' ? (() => { const deviceType = deviceTypesById.get('deviceTypeId' in entity ? entity.deviceTypeId : ''); const area = areasById.get('areaId' in entity ? entity.areaId ?? '' : ''); return `${deviceType?.name ?? '未知设备'} · ${area?.name ?? deviceCategoryLabels[deviceType?.category ?? ''] ?? '未分类'}`; })() : type === 'area' ? `${areaDeviceCounts.get(entity.id) || 0} 台设备` : entityLabels[type];
     const feedbackSummary = data.feedbackSummaries?.[entity.id] || { total: 0, unanswered: 0 };
     const activityLevel = 'activityLevel' in entity ? normalizedActivity(entity.activityLevel) : 0;
     const activityUpdatedAt = 'activityUpdatedAt' in entity ? entity.activityUpdatedAt : undefined;
     const todayActivity = type === 'person' && 'todayActivity' in entity ? entity.todayActivity : undefined;
     const activityHeatItems: PersonActivityHeatItem[] = type === 'person' ? [
-      ...(todayActivity?.deviceTypes || []).filter(item => item.activityValue > 0).map(item => ({ sourceType: 'deviceType' as const, name: data.deviceTypes.find(source => source.id === item.sourceId)?.name ?? '已删除设备类型', activityValue: item.activityValue })),
-      ...(todayActivity?.products || []).filter(item => item.activityValue > 0).map(item => ({ sourceType: 'product' as const, name: data.products.find(source => source.id === item.sourceId)?.name ?? '已删除系统', activityValue: item.activityValue })),
+      ...(todayActivity?.deviceTypes || []).filter(item => item.activityValue > 0).map(item => ({ sourceType: 'deviceType' as const, name: deviceTypesById.get(item.sourceId)?.name ?? '已删除设备类型', activityValue: item.activityValue })),
+      ...(todayActivity?.products || []).filter(item => item.activityValue > 0).map(item => ({ sourceType: 'product' as const, name: productsById.get(item.sourceId)?.name ?? '已删除系统', activityValue: item.activityValue })),
     ].sort((a, b) => b.activityValue - a.activityValue) : [];
-    return { id: entity.id, type: 'entity', position: data.settings.positions[entity.id] ?? { x: 0, y: 0 }, data: { entityType: type, name: entity.name, icon: entityIconName(data, type, entity), subtitle, count: data.relations.filter(r => r.sourceId === entity.id || r.targetId === entity.id).length, totalFeedbacks: feedbackSummary.total, unansweredFeedbacks: feedbackSummary.unanswered, activityLevel, activityUpdatedAt, todayActivity, activityHeatItems, selected: entity.id === selectedId, dimmed: !!selectedId && !related.has(entity.id) } };
+    return { id: entity.id, type: 'entity', position: data.settings.positions[entity.id] ?? { x: 0, y: 0 }, data: { entityType: type, name: entity.name, icon: entityIconName(data, type, entity), subtitle, count: relationCounts.get(entity.id) || 0, totalFeedbacks: feedbackSummary.total, unansweredFeedbacks: feedbackSummary.unanswered, activityLevel, activityUpdatedAt, todayActivity, activityHeatItems, selected: entity.id === selectedId, dimmed: !!selectedId && !related.has(entity.id) } };
   });
-  const edges: Edge[] = relations.map(rel => ({ id: rel.id, source: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.targetId : rel.sourceId, target: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.sourceId : rel.targetId, label: rel.relationType === 'installed_in' ? '安装设备' : rel.relationType === 'holds_position' ? '任职人员' : (rel.label ?? relationLabels[rel.relationType]), animated: selectedId === rel.sourceId || selectedId === rel.targetId, style: { stroke: relationColors[rel.relationType], strokeWidth: selectedId === rel.sourceId || selectedId === rel.targetId ? 2.6 : 1.2, opacity: selectedId && rel.sourceId !== selectedId && rel.targetId !== selectedId ? .12 : .72, strokeDasharray: ['binds_to', 'manages', 'covers'].includes(rel.relationType) ? '6 4' : undefined }, labelStyle: { fill: '#9fb3c8', fontSize: 10 }, labelBgStyle: { fill: '#07192c', fillOpacity: .86 }, markerEnd: { type: MarkerType.ArrowClosed, color: relationColors[rel.relationType] } }));
+  const edges: Edge[] = relations.map(rel => ({ id: rel.id, source: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.targetId : rel.sourceId, target: ['installed_in', 'holds_position'].includes(rel.relationType) ? rel.sourceId : rel.targetId, label: rel.relationType === 'installed_in' ? '安装设备' : rel.relationType === 'holds_position' ? '任职人员' : (rel.label ?? relationLabels[rel.relationType]), style: { stroke: relationColors[rel.relationType], strokeWidth: 1.2, opacity: .72, strokeDasharray: ['binds_to', 'manages', 'covers'].includes(rel.relationType) ? '6 4' : undefined }, labelStyle: { fill: '#9fb3c8', fontSize: 10 }, labelBgStyle: { fill: '#07192c', fillOpacity: .86 }, markerEnd: { type: MarkerType.ArrowClosed, color: relationColors[rel.relationType] } }));
   return { nodes, edges };
 }
 
@@ -182,7 +199,59 @@ function layout<T extends Record<string, unknown>>(nodes: Node<T>[], edges: Edge
   graph.setGraph({ rankdir: direction, ranksep: 125, nodesep: 34, edgesep: 18, marginx: 40, marginy: 40 });
   nodes.forEach(node => graph.setNode(node.id, { width: 218, height: 82 }));
   edges.forEach(edge => graph.setEdge(edge.source, edge.target)); dagre.layout(graph);
-  return nodes.map(node => { const pos = graph.node(node.id); return { ...node, position: { x: pos.x - 109, y: pos.y - 41 } }; });
+  const placed = nodes.map(node => { const pos = graph.node(node.id); return { ...node, position: { x: pos.x - 109, y: pos.y - 41 } }; });
+  if (direction !== 'LR' || nodes.length < 24) return placed;
+
+  const nodeWidth = 218; const nodeHeight = 82; const rankGap = 125; const rowGap = 34; const columnGap = 54; const margin = 40;
+  const rankedNodes = new Map<number, Array<{ id: string; y: number }>>();
+  nodes.forEach(node => {
+    const pos = graph.node(node.id);
+    const rank = Math.round(pos.x);
+    rankedNodes.set(rank, [...(rankedNodes.get(rank) || []), { id: node.id, y: pos.y }]);
+  });
+  const ranks = [...rankedNodes.entries()].sort(([a], [b]) => a - b).map(([, items]) => items.sort((a, b) => a.y - b.y));
+  const originalWidth = Math.max(...placed.map(node => node.position.x + nodeWidth)) - Math.min(...placed.map(node => node.position.x));
+  const originalHeight = Math.max(...placed.map(node => node.position.y + nodeHeight)) - Math.min(...placed.map(node => node.position.y));
+  const targetAspect = 16 / 9;
+  if (originalWidth / Math.max(originalHeight, 1) >= targetAspect * .78) return placed;
+
+  const maxRankSize = Math.max(...ranks.map(rank => rank.length));
+  let bestRows = maxRankSize;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (let maxRows = 2; maxRows <= maxRankSize; maxRows += 1) {
+    const blocks = ranks.map(rank => {
+      const columns = Math.ceil(rank.length / maxRows);
+      const rows = Math.ceil(rank.length / columns);
+      return { width: columns * nodeWidth + (columns - 1) * columnGap, height: rows * nodeHeight + (rows - 1) * rowGap };
+    });
+    const width = blocks.reduce((sum, block) => sum + block.width, 0) + Math.max(0, blocks.length - 1) * rankGap + margin * 2;
+    const height = Math.max(...blocks.map(block => block.height)) + margin * 2;
+    const score = Math.abs(Math.log((width / height) / targetAspect));
+    if (score < bestScore) { bestScore = score; bestRows = maxRows; }
+  }
+
+  const nextPositions = new Map<string, { x: number; y: number }>();
+  const blocks = ranks.map(rank => {
+    const columns = Math.ceil(rank.length / bestRows);
+    const rows = Math.ceil(rank.length / columns);
+    return { rank, columns, rows, width: columns * nodeWidth + (columns - 1) * columnGap, height: rows * nodeHeight + (rows - 1) * rowGap };
+  });
+  const contentHeight = Math.max(...blocks.map(block => block.height));
+  let cursorX = margin;
+  blocks.forEach(block => {
+    block.rank.forEach((item, index) => {
+      const column = Math.floor(index / block.rows);
+      const row = index % block.rows;
+      const columnItems = Math.min(block.rows, block.rank.length - column * block.rows);
+      const columnHeight = columnItems * nodeHeight + Math.max(0, columnItems - 1) * rowGap;
+      nextPositions.set(item.id, {
+        x: cursorX + column * (nodeWidth + columnGap),
+        y: margin + (contentHeight - columnHeight) / 2 + row * (nodeHeight + rowGap),
+      });
+    });
+    cursorX += block.width + rankGap;
+  });
+  return placed.map(node => ({ ...node, position: nextPositions.get(node.id) ?? node.position }));
 }
 
 function AppContent() {
@@ -202,6 +271,9 @@ function AppContent() {
   const [managerTab, setManagerTab] = useState<EntityType>('team');
   const [editor, setEditor] = useState<{ type: EntityType; item?: Entity } | null>(null);
   const [nodeContextMenu, setNodeContextMenu] = useState<{ type: EntityType; entity: Entity; x: number; y: number } | null>(null);
+  const [graphZoom, setGraphZoom] = useState(1);
+  const [graphNavigating, setGraphNavigating] = useState(false);
+  const [exportingGraph, setExportingGraph] = useState(false);
   const [relationEditor, setRelationEditor] = useState<Partial<Relation> | null>(null);
   const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
   const [clearConfirmText, setClearConfirmText] = useState('');
@@ -239,20 +311,26 @@ function AppContent() {
   }, [loadStoredFile, message]);
 
   const elements = useMemo(() => data ? graphElements(data, selectedId, filter) : { nodes: [], edges: [] }, [data, selectedId, filter]);
-  const graphLayoutSignature = useMemo(() => JSON.stringify([data?.settings.layoutDirection, elements.nodes.map(node => node.id), elements.edges.map(edge => [edge.id, edge.source, edge.target])]), [data?.settings.layoutDirection, elements.edges, elements.nodes]);
+  const baseEdges = useMemo(() => elements.edges, [data?.relations, filter, filter === 'selected' ? selectedId : null]);
+  const graphLayoutSignature = useMemo(() => JSON.stringify([data?.settings.layoutDirection, elements.nodes.map(node => node.id), baseEdges.map(edge => [edge.id, edge.source, edge.target])]), [baseEdges, data?.settings.layoutDirection, elements.nodes]);
   const previousGraphLayoutSignature = useRef('');
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<GraphNodeData>>(elements.nodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(elements.edges);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(baseEdges);
+  const graphOverview = nodes.length > 80 && graphZoom < .5;
+  const baseRenderedEdges = useMemo(() => graphOverview && !exportingGraph ? edges.map(edge => ({ ...edge, label: undefined })) : edges, [edges, exportingGraph, graphOverview]);
+  const focusedEdges = useMemo(() => selectedId ? edges.filter(edge => edge.source === selectedId || edge.target === selectedId).map(edge => ({ ...edge, id: `focus:${edge.id}`, className: 'is-focus-edge', animated: true, selectable: false, focusable: false, interactionWidth: 0, data: { ...edge.data, relationId: edge.id }, style: { ...edge.style, strokeWidth: 2.6, opacity: .72 } })) : [], [edges, selectedId]);
+  const renderedEdges = useMemo(() => [...baseRenderedEdges, ...focusedEdges], [baseRenderedEdges, focusedEdges]);
   useEffect(() => {
     const shouldLayout = previousGraphLayoutSignature.current !== graphLayoutSignature;
     previousGraphLayoutSignature.current = graphLayoutSignature;
     setNodes(currentNodes => {
       const currentPositions = new Map(currentNodes.map(node => [node.id, node.position]));
-      const nextNodes = shouldLayout ? layout(elements.nodes, elements.edges, data?.settings.layoutDirection ?? 'LR') : elements.nodes;
+      const nextNodes = shouldLayout ? layout(elements.nodes, baseEdges, data?.settings.layoutDirection ?? 'LR') : elements.nodes;
       return nextNodes.map(node => ({ ...node, position: data?.settings.positions[node.id] ?? currentPositions.get(node.id) ?? node.position }));
     });
-    setEdges(elements.edges);
-  }, [data?.settings.layoutDirection, data?.settings.positions, elements, graphLayoutSignature, setEdges, setNodes]);
+    setEdges(baseEdges);
+  }, [baseEdges, data?.settings.layoutDirection, data?.settings.positions, elements, graphLayoutSignature, setEdges, setNodes]);
+  useEffect(() => { const timer = window.setTimeout(() => flowRef.current?.fitView({ padding: .12, duration: 350 }), 120); return () => window.clearTimeout(timer); }, [graphLayoutSignature]);
   useEffect(() => { const timer = window.setTimeout(() => flowRef.current?.fitView({ padding: .12, duration: 350 }), 260); return () => window.clearTimeout(timer); }, [leftPanelVisible, rightPanelVisible]);
   useEffect(() => {
     const media = window.matchMedia(narrowViewportQuery);
@@ -295,14 +373,18 @@ function AppContent() {
 
   const treeData = useMemo<DataNode[]>(() => {
     if (!data) return [];
-    const peopleAt = (positionId: string): DataNode[] => data.persons.filter(person => person.positionIds.includes(positionId)).map(person => ({ key: person.id, title: person.name, icon: <UserOutlined /> }));
+    const peopleByPosition = new Map<string, DataNode[]>();
+    data.persons.forEach(person => person.positionIds.forEach(positionId => peopleByPosition.set(positionId, [...(peopleByPosition.get(positionId) || []), { key: person.id, title: person.name, icon: <UserOutlined /> }])));
+    const devicesByArea = new Map<string, typeof data.devices>();
+    data.devices.forEach(device => { if (device.areaId) devicesByArea.set(device.areaId, [...(devicesByArea.get(device.areaId) || []), device]); });
+    const peopleAt = (positionId: string): DataNode[] => peopleByPosition.get(positionId) || [];
     const positionNodes: DataNode[] = [...data.positions].sort((a, b) => a.sort - b.sort).map(position => ({ key: position.id, title: position.name, icon: <IdcardOutlined />, children: peopleAt(position.id) }));
-    const areaNodes = data.areas.map(area => ({ key: area.id, title: `${area.name}（${data.devices.filter(device => device.areaId === area.id).length}）`, icon: <EnvironmentOutlined />, children: data.devices.filter(device => device.areaId === area.id).map(device => ({ key: device.id, title: device.name, icon: <VideoCameraOutlined /> })) }));
+    const areaNodes = data.areas.map(area => { const devices = devicesByArea.get(area.id) || []; return { key: area.id, title: `${area.name}（${devices.length}）`, icon: <EnvironmentOutlined />, children: devices.map(device => ({ key: device.id, title: device.name, icon: <VideoCameraOutlined /> })) }; });
     return [{ key: data.project.id, title: data.project.name, icon: <BankOutlined />, children: [...positionNodes, { key: 'group-areas', title: '施工区域', icon: <EnvironmentOutlined />, children: areaNodes }] }];
   }, [data]);
 
   const locate = (value: string) => { if (!entityIndex.has(value)) return; setSelectedId(value); setSelectedRelation(null); requestAnimationFrame(() => { const node = nodes.find(item => item.id === value); if (node) flowRef.current?.setCenter(node.position.x + 109, node.position.y + 41, { zoom: 1.3, duration: 450 }); }); };
-  const entityOptions = (data ? allEntities(data) : []).map(item => ({ value: item.entity.id, label: `${entityLabels[item.type]} · ${item.entity.name}` }));
+  const entityOptions = useMemo(() => (data ? allEntities(data) : []).map(item => ({ value: item.entity.id, label: `${entityLabels[item.type]} · ${item.entity.name}` })), [data]);
 
   const exportJson = async () => { if (!data) return; try { const value = await apiRequest<ProjectRelationshipData>(`/projects/${data.project.id}/export`, { cache: 'no-store' }); const blob = new Blob([JSON.stringify(value, null, 2)], { type: 'application/json;charset=utf-8' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = `项目部关系配置-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.json`; link.click(); URL.revokeObjectURL(link.href); message.success('JSON 配置已导出'); } catch (error) { message.error(error instanceof Error ? error.message : 'JSON 导出失败'); } };
   const exportCompleteGraph = async () => {
@@ -310,6 +392,8 @@ function AppContent() {
     const flow = flowRef.current;
     if (!viewport || !flow || !nodes.length) return message.warning('当前没有可导出的关系图');
     try {
+      setExportingGraph(true);
+      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
       await document.fonts.ready;
       const bounds = flow.getNodesBounds(nodes);
       const padding = 96;
@@ -323,6 +407,7 @@ function AppContent() {
       const link = document.createElement('a'); link.href = image; link.download = `${data?.project.name ?? '项目关系图'}-完整关系图-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}.png`; link.click();
       message.success(`完整关系图已导出（${Math.round(width * pixelRatio)} × ${Math.round(height * pixelRatio)}）`);
     } catch { message.error('完整关系图导出失败'); }
+    finally { setExportingGraph(false); }
   };
   const importJson = async (file: File) => { try { const value: unknown = JSON.parse(await file.text()); if (!isProjectData(value)) throw new Error('配置结构无效'); await apiRequest(`/projects/${value.project.id}/import`, { method: 'POST', body: JSON.stringify(value) }); const loaded = await loadStoredFile(); if (!loaded) throw new Error('导入后未读取到项目数据'); setData(loaded); setLoadError(null); setSelectedId(null); message.success('JSON 导入成功，关系图已更新'); } catch (error) { message.error(error instanceof Error ? error.message : '导入失败：请选择有效的 JSON 文件'); } };
   const createBlankProject = async () => { try { await apiRequest('/projects', { method: 'POST', body: JSON.stringify({ name: '未命名项目部' }) }); const loaded = await loadStoredFile(); if (!loaded) throw new Error('项目创建后读取失败'); setData(loaded); setLoadError(null); message.success('空白项目已创建'); } catch (error) { message.error(error instanceof Error ? error.message : '项目创建失败'); } };
@@ -400,7 +485,7 @@ function AppContent() {
     <header className="topbar">
       <div className="brand"><div className="brand-mark"><BankOutlined /></div><div><Title level={4}>{data.project.name}</Title><Text>组织 · 区域 · 设备 · 产品关系中枢</Text></div></div>
       <div className="toolbar">
-        <Select value={filter} onChange={setFilter} className="filter-select" options={[{ value: 'deviceChain', label: '设备全链路' }, { value: 'area', label: '只看区域与设备' }, { value: 'binding', label: '只看设备绑定' }, { value: 'product', label: '只看岗位与系统功能' }, { value: 'device', label: '只看设备与系统功能' }, { value: 'organization', label: '只看组织关系' }, { value: 'all', label: '全部关系' }, { value: 'selected', label: '只看当前选中对象' }]} />
+        <Select value={filter} onChange={setFilter} className="filter-select" options={[{ value: 'all', label: '全部关系' }, { value: 'organization', label: '只看组织关系' }, { value: 'product', label: '只看岗位与系统功能' }, { value: 'device', label: '只看设备与系统功能' }, { value: 'area', label: '只看区域与设备' }, { value: 'binding', label: '只看设备绑定' }, { value: 'deviceChain', label: '设备全链路' }, { value: 'selected', label: '只看当前选中对象' }]} />
         <Select showSearch allowClear placeholder="搜索区域、设备、人员或产品" suffixIcon={<SearchOutlined />} className="search-select" options={entityOptions} filterOption={(input, option) => String(option?.label).toLowerCase().includes(input.toLowerCase())} onSelect={locate} />
         <Tooltip title="自动布局"><Button icon={<ApartmentOutlined />} onClick={performLayout} /></Tooltip>
         <Tooltip title="适应画布"><Button icon={<ExpandOutlined />} onClick={() => flowRef.current?.fitView({ padding: .12, duration: 400 })} /></Tooltip>
@@ -420,7 +505,7 @@ function AppContent() {
         {editMode && <div className="left-panel-actions"><Button icon={<EditOutlined />} onClick={() => openEditor('project', data.project)}>项目信息</Button><Button icon={<AppstoreOutlined />} onClick={() => setManagerOpen(true)}>实体管理</Button></div>}
       </aside>
 
-      <section className="graph-panel">
+      <section className={`graph-panel ${graphNavigating ? 'is-navigating' : ''} ${graphOverview ? 'is-overview' : ''} ${selectedId ? 'has-node-selection' : ''}`}>
         <Tooltip title={leftPanelVisible ? '隐藏组织架构' : '显示组织架构'} placement="right">
           <Button className="panel-toggle panel-toggle-left" shape="circle" size="small" aria-label={leftPanelVisible ? '隐藏组织架构' : '显示组织架构'} icon={leftPanelVisible ? <LeftOutlined /> : <RightOutlined />} onClick={toggleLeftPanel} />
         </Tooltip>
@@ -428,7 +513,7 @@ function AppContent() {
           <Button className="panel-toggle panel-toggle-right" shape="circle" size="small" aria-label={rightPanelVisible ? '隐藏详情面板' : '显示详情面板'} icon={rightPanelVisible ? <RightOutlined /> : <LeftOutlined />} onClick={toggleRightPanel} />
         </Tooltip>
         <div className="graph-caption"><div><Text className="eyebrow">RELATIONSHIP CANVAS</Text><strong>{filter === 'all' ? '全域关系视图' : filter === 'deviceChain' ? '设备业务全链路' : filter === 'area' ? '区域设备部署视图' : '聚焦关系视图'}</strong></div><div className="legend">{(['uses', 'installed_in', 'supports', 'binds_to'] as RelationType[]).map(type => <span key={type}><i style={{ background: relationColors[type] }} />{relationLabels[type]}</span>)}</div></div>
-        <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onInit={instance => { flowRef.current = instance; setTimeout(() => instance.fitView({ padding: .1 }), 80); }} onNodeClick={(_, node) => { setNodeContextMenu(null); setSelectedId(node.id); setSelectedRelation(null); }} onNodeContextMenu={(event, node) => { event.preventDefault(); const item = entityIndex.get(node.id); if (!item) return; const menuWidth = 176; const menuHeight = 128; setNodeContextMenu({ type: item.type, entity: item.entity, x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)) }); window.requestAnimationFrame(() => window.requestAnimationFrame(() => startTransition(() => { setSelectedId(node.id); setSelectedRelation(null); }))); }} onEdgeClick={(_, edge) => { setNodeContextMenu(null); setSelectedRelation(edge.id); setSelectedId(null); }} onConnect={onConnect} nodesConnectable nodesDraggable onPaneClick={() => { setNodeContextMenu(null); setSelectedId(null); setSelectedRelation(null); }} onNodeDragStop={(_, node) => { if (!data) return; const next = { ...data, settings: { ...data.settings, positions: { ...data.settings.positions, [node.id]: node.position } } }; update(next); void apiRequest(`/projects/${data.project.id}/layouts/${node.id}`, { method: 'PATCH', body: JSON.stringify(node.position) }).catch(error => message.error(error instanceof Error ? error.message : '节点布局同步失败')); }} minZoom={.08} maxZoom={2.4} fitView>
+        <ReactFlow nodes={nodes} edges={renderedEdges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onlyRenderVisibleElements={!exportingGraph} onMoveStart={() => setGraphNavigating(true)} onMoveEnd={(_, viewport) => { setGraphNavigating(false); setGraphZoom(viewport.zoom); }} onInit={instance => { flowRef.current = instance; setTimeout(() => instance.fitView({ padding: .1 }), 80); }} onNodeClick={(_, node) => { setNodeContextMenu(null); setSelectedId(node.id); setSelectedRelation(null); }} onNodeContextMenu={(event, node) => { event.preventDefault(); const item = entityIndex.get(node.id); if (!item) return; const menuWidth = 176; const menuHeight = 128; setNodeContextMenu({ type: item.type, entity: item.entity, x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)), y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)) }); window.requestAnimationFrame(() => window.requestAnimationFrame(() => startTransition(() => { setSelectedId(node.id); setSelectedRelation(null); }))); }} onEdgeClick={(_, edge) => { setNodeContextMenu(null); setSelectedRelation(String(edge.data?.relationId ?? edge.id)); setSelectedId(null); }} onConnect={onConnect} nodesConnectable nodesDraggable onPaneClick={() => { setNodeContextMenu(null); setSelectedId(null); setSelectedRelation(null); }} onNodeDragStop={(_, node) => { if (!data) return; const next = { ...data, settings: { ...data.settings, positions: { ...data.settings.positions, [node.id]: node.position } } }; update(next); void apiRequest(`/projects/${data.project.id}/layouts/${node.id}`, { method: 'PATCH', body: JSON.stringify(node.position) }).catch(error => message.error(error instanceof Error ? error.message : '节点布局同步失败')); }} minZoom={.08} maxZoom={2.4} fitView>
           <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="rgba(84,151,255,.18)" /><MiniMap nodeColor={node => typeColors[(node.data as GraphNodeData).entityType]} maskColor="rgba(4,15,28,.74)" /><Controls />
         </ReactFlow>
         {nodeContextMenu && <div className="node-context-menu" role="menu" style={{ left: nodeContextMenu.x, top: nodeContextMenu.y }}>

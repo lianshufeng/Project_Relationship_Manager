@@ -42,10 +42,15 @@ button, input { font: inherit; }
 .legend span { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #8ea8c1; }
 .legend i { width: 12px; height: 2px; border-radius: 2px; }
 .react-flow__edge-text { font-weight: 500; }
+.graph-panel.has-node-selection .react-flow__edge:not(.is-focus-edge) { opacity: .17; }
+.graph-panel .react-flow__edge.is-focus-edge { pointer-events: none; }
+.graph-panel.is-overview .react-flow__edge:not(.is-focus-edge) .react-flow__edge-text, .graph-panel.is-overview .react-flow__edge:not(.is-focus-edge) .react-flow__edge-textbg, .graph-panel.is-navigating .react-flow__edge-text, .graph-panel.is-navigating .react-flow__edge-textbg { display: none; }
+.graph-panel.is-navigating .react-flow__edge.animated path { animation: none; }
+.graph-panel.is-navigating .entity-node { box-shadow: inset 3px 0 0 var(--node-color); transition: none; }
 .react-flow__controls { border: 1px solid rgba(84,151,255,.25); border-radius: 8px; overflow: hidden; box-shadow: none; }
 .react-flow__controls-button { background: #0b1f36; border-color: rgba(84,151,255,.17); color: #b9cce0; fill: #b9cce0; }
 .react-flow__minimap { background: #07192c; border: 1px solid rgba(84,151,255,.18); border-radius: 8px; }
-.entity-node { position: relative; width: 218px; min-height: 78px; display: flex; align-items: center; gap: 11px; padding: 12px; border-radius: 11px; color: #eef6ff; background: linear-gradient(145deg, rgba(13,39,65,.98), rgba(7,27,48,.98)); border: 1px solid color-mix(in srgb, var(--node-color) 46%, transparent); box-shadow: inset 3px 0 0 var(--node-color), 0 7px 20px rgba(0,0,0,.25); transition: opacity .18s, transform .18s, box-shadow .18s; }
+.entity-node { position: relative; width: 218px; min-height: 78px; contain: layout style; display: flex; align-items: center; gap: 11px; padding: 12px; border-radius: 11px; color: #eef6ff; background: linear-gradient(145deg, rgba(13,39,65,.98), rgba(7,27,48,.98)); border: 1px solid color-mix(in srgb, var(--node-color) 46%, transparent); box-shadow: inset 3px 0 0 var(--node-color), 0 7px 20px rgba(0,0,0,.25); transition: opacity .18s, transform .18s, box-shadow .18s; }
 .entity-node.selected { transform: translateY(-2px); border-color: var(--node-color); box-shadow: inset 3px 0 0 var(--node-color), 0 0 0 2px color-mix(in srgb, var(--node-color) 24%, transparent), 0 10px 28px rgba(0,0,0,.4); }
 .entity-node.dimmed { opacity: .22; }
 .node-icon { width: 36px; height: 36px; flex: 0 0 36px; display: grid; place-items: center; color: var(--node-color); font-size: 17px; border-radius: 9px; background: color-mix(in srgb, var(--node-color) 12%, transparent); border: 1px solid color-mix(in srgb, var(--node-color) 24%, transparent); }
